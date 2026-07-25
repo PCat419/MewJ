@@ -48,6 +48,10 @@ WIND_TILES = {"east": "1z", "south": "2z", "west": "3z", "north": "4z"}
 YAKUHAI_KEEP_BASE = _S["yakuhai_keep_base"]
 YAKUHAI_KEEP_MIN_SHANTEN = _S["yakuhai_keep_min_shanten"]
 
+# 同向听：EV 与和率/听牌率按交换率合成进攻效用（无绝对 EV 门槛）
+NEAR_TIE_WIN_SCALE = _S["near_tie_win_scale"]
+NEAR_TIE_TENPAI_SCALE = _S["near_tie_tenpai_scale"]
+
 
 def _as_float(value: Any, default: float = 0.0) -> float:
     try:
@@ -124,6 +128,38 @@ def offense_utility(candidate: Dict[str, Any]) -> float:
     if value is None:
         return fallback_offense_utility(candidate)
     return max(0.0, _as_float(value))
+
+
+def apply_near_tie_win_break(
+    candidates: List[Dict[str, Any]],
+    offenses: List[float],
+    *,
+    group_fallback: bool = False,
+) -> List[float]:
+    """Blend win/tenpai into min-shanten offense via an EV exchange rate.
+
+    For same-shanten cuts with nanikiru ``exp_score``:
+    ``offense = EV + win_prob * win_scale + tenpai_prob * tenpai_scale``.
+    Candidate B overturns A iff
+    ``ΔEV + Δwin * win_scale + Δtenpai * tenpai_scale > 0`` —
+    both gaps are weighed together; there is no absolute EV band.
+    Skipped on the fallback formula (it already weights win/tenpai).
+    """
+    if group_fallback or not candidates or len(candidates) != len(offenses):
+        return list(offenses)
+    min_s = min(_as_int(c.get("shanten"), 99) for c in candidates)
+    win_scale = _as_float(NEAR_TIE_WIN_SCALE, 1000.0)
+    tenpai_scale = _as_float(NEAR_TIE_TENPAI_SCALE, 200.0)
+    out = list(offenses)
+    for i, c in enumerate(candidates):
+        if _as_int(c.get("shanten"), 99) != min_s:
+            continue
+        if c.get("exp_score") is None:
+            continue
+        win = min(1.0, max(0.0, _as_float(c.get("win_prob"))))
+        tenpai = min(1.0, max(0.0, _as_float(c.get("tenpai_prob"))))
+        out[i] = out[i] + win * win_scale + tenpai * tenpai_scale
+    return out
 
 
 def softmax_weights(
@@ -343,12 +379,18 @@ def score_candidates(
         )
 
     utilities: List[float] = []
+    base_offenses: List[float] = []
     for candidate in candidates:
-        tile = normalize_tile(candidate.get("tile"))
         if group_fallback:
-            offense = fallback_offense_utility(candidate)
+            base_offenses.append(fallback_offense_utility(candidate))
         else:
-            offense = offense_utility(candidate)
+            base_offenses.append(offense_utility(candidate))
+    offenses = apply_near_tie_win_break(
+        candidates, base_offenses, group_fallback=group_fallback
+    )
+
+    for candidate, offense in zip(candidates, offenses):
+        tile = normalize_tile(candidate.get("tile"))
         components: Dict[str, Dict[str, float]] = {}
         risk_cost = 0.0
         confidence = "none"
@@ -428,8 +470,10 @@ def best_candidate(candidates: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]
             -_as_float(c.get("recommendation_weight")),
             1 if c.get("furiten") else 0,
             _as_int(c.get("shanten"), 99),
-            -_as_int(c.get("uke")),
+            -_as_float(c.get("win_prob")),
             -_as_float(c.get("tenpai_prob")),
+            -_as_float(c.get("exp_score")),
+            -_as_int(c.get("uke")),
             str(c.get("tile") or ""),
         ),
     )

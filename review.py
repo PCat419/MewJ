@@ -293,9 +293,12 @@ def _cand_shanten(c: dict) -> int:
     return int(s) if s is not None else 99
 
 
-# 拆听（0→1 向听）的 EV 增益单独门槛：听牌的先制/罚符/流局价值不体现在
-# EV 差中，只有足够大的改良补偿才允许放弃听牌。
-RETREAT_FROM_TENPAI_EV_MIN = float(_P["review"]["retreat"]["from_tenpai_ev_min"])
+# 拆听门控：听牌先制/罚符价值不体现在纯 EV 差中。
+# 和率不降 → 放行；和率下降 → ΔEV 与 Δ和率按交换率结算；无和率统计 → EV 下限。
+_RETREAT = _P["review"]["retreat"]
+RETREAT_FROM_TENPAI_EV_MIN = float(_RETREAT["from_tenpai_ev_min"])
+RETREAT_FROM_TENPAI_WIN_SCALE = float(_RETREAT["from_tenpai_win_scale"])
+RETREAT_FROM_TENPAI_TENPAI_SCALE = float(_RETREAT["from_tenpai_tenpai_scale"])
 
 
 def _allows_retreat(
@@ -305,8 +308,9 @@ def _allows_retreat(
 ) -> bool:
     """Whether ``candidate`` (higher shanten) may beat ``advance`` (最低向听).
 
-    拆听（从 0 向听退向）是质变而非程度差异，单独判定：和了率不降
-    （改良为真）或 EV 增益 ≥ RETREAT_FROM_TENPAI_EV_MIN 才放行。
+    拆听（0→1）：和率不降视为真改良直接放行；和率下降时要求
+    ``ΔEV + Δ和率×win_scale + Δ听牌率×tenpai_scale ≥ 0``（役满肥尾抬 EV
+    但和率崩盘时过不了闸）。无和率统计时回退 ``ΔEV ≥ from_tenpai_ev_min``。
     其余退向沿用按巡目/深度递进的 EV 与听牌率阈值。
     """
     gap = _cand_shanten(candidate) - _cand_shanten(advance)
@@ -314,8 +318,19 @@ def _allows_retreat(
         return True
     delta = _cand_ev(candidate) - _cand_ev(advance)
     if _cand_shanten(advance) == 0:
-        improves_win = 0.0 < _cand_winp(advance) <= _cand_winp(candidate)
-        return improves_win or delta >= RETREAT_FROM_TENPAI_EV_MIN
+        win_a = _cand_winp(advance)
+        win_c = _cand_winp(candidate)
+        if 0.0 < win_a <= win_c:
+            return True
+        if win_a <= 0.0 and win_c <= 0.0:
+            return delta >= RETREAT_FROM_TENPAI_EV_MIN
+        net = (
+            delta
+            + (win_c - win_a) * RETREAT_FROM_TENPAI_WIN_SCALE
+            + (_cand_tenpai(candidate) - _cand_tenpai(advance))
+            * RETREAT_FROM_TENPAI_TENPAI_SCALE
+        )
+        return net >= 0.0
     need_ev = _delta_ev_min(turn, gap)
     need_ten = _tenpai_rate_min(turn, gap)
     return delta >= need_ev and _cand_tenpai(candidate) >= need_ten
@@ -342,9 +357,10 @@ def pick_recommended(
     advance_pool.sort(
         key=lambda c: (
             1 if c.get("furiten") else 0,
-            -_cand_uke(c),
             -_cand_ev(c),
+            -_cand_winp(c),
             -_cand_tenpai(c),
+            -_cand_uke(c),
             c.get("tile") or "",
         )
     )
@@ -360,9 +376,10 @@ def pick_recommended(
     allowed.sort(
         key=lambda c: (
             1 if c.get("furiten") else 0,
-            -_cand_uke(c),
             -_cand_ev(c),
+            -_cand_winp(c),
             -_cand_tenpai(c),
+            -_cand_uke(c),
             _cand_shanten(c),
             c.get("tile") or "",
         )
@@ -381,8 +398,8 @@ def _cand_utility(c: dict) -> float:
 def _policy_valid_candidates(candidates: List[dict], turn: int) -> List[dict]:
     """进取（最低向听）候选 + 过闸退向候选。
 
-    与 pick_recommended 同一套门控：拆听须过专项门控（win_p 不降或
-    EV 增益 ≥800），其余退向须过巡目/深度阈值。供 _attach_defense 在
+    与 pick_recommended 同一套门控：拆听须过和率交换率（或无统计时 EV
+    下限），其余退向须过巡目/深度阈值。供 _attach_defense 在
     集合内按调整后效用选最优，避免门控被 argmax 架空（原 R1 死代码）。
     """
     if not candidates:
@@ -392,9 +409,10 @@ def _policy_valid_candidates(candidates: List[dict], turn: int) -> List[dict]:
     advance_pool.sort(
         key=lambda c: (
             1 if c.get("furiten") else 0,
-            -_cand_uke(c),
             -_cand_ev(c),
+            -_cand_winp(c),
             -_cand_tenpai(c),
+            -_cand_uke(c),
             c.get("tile") or "",
         )
     )
@@ -417,7 +435,7 @@ def _order_candidates_with_best(
 ) -> List[dict]:
     """Rank list: recommended first, then policy-valid cuts, then the rest.
 
-    Within each group: lower shanten, then higher (risk-adjusted) uke, then EV.
+    Within each group: lower shanten, then higher EV, win rate, tenpai, uke.
     Rejected 退向 cuts sink below same/lower-shanten alternatives.
     """
     if not candidates:
@@ -435,9 +453,10 @@ def _order_candidates_with_best(
     advance_pool = [c for c in candidates if _cand_shanten(c) == min_s]
     advance_pool.sort(
         key=lambda c: (
-            -_cand_uke(c),
             -_cand_ev(c),
+            -_cand_winp(c),
             -_cand_tenpai(c),
+            -_cand_uke(c),
             c.get("tile") or "",
         )
     )
@@ -454,34 +473,65 @@ def _order_candidates_with_best(
             0 if best and tile == best else 1,
             0 if is_policy_valid(c) else 1,
             _cand_shanten(c),
-            -_cand_uke(c),
             -_cand_ev(c),
+            -_cand_winp(c),
             -_cand_tenpai(c),
+            -_cand_uke(c),
             tile or "",
         )
 
     return sorted(candidates, key=sort_key)
 
 
-def _rescore_policy_pool(cands: List[dict]) -> None:
-    """权重池与推荐资格一致：policy_rejected 候选不进入 softmax 池。
+def _retreat_exchange_net(advance: dict, candidate: dict) -> float:
+    """ΔEV + Δ和率×Sw + Δ听牌率×St（与拆听门控同一交换率）。"""
+    return (
+        (_cand_ev(candidate) - _cand_ev(advance))
+        + (_cand_winp(candidate) - _cand_winp(advance))
+        * RETREAT_FROM_TENPAI_WIN_SCALE
+        + (_cand_tenpai(candidate) - _cand_tenpai(advance))
+        * RETREAT_FROM_TENPAI_TENPAI_SCALE
+    )
 
-    被门控（拆听/退向阈值）或振听过滤判定不可推荐的候选，显示权重压至
-    MIN_RECOMMENDATION_WEIGHT（<0.01%，沿用 posture._rescore_maneuver 的既有
-    范式）；行内 EV/效用等数值照常显示。一致/尚可分类在调用本函数前已完成，
-    统计口径不受影响。
+
+def _rescore_policy_pool(cands: List[dict]) -> None:
+    """显示权重：全体候选进 softmax（和为 100%），判定资格不变。
+
+    对齐副露报告口径（call_eval）：判定用门控选 best；权重仅作显示校准。
+    - 合格候选：用 ``adjusted_utility``；
+    - 未过闸：相对最优合格切的显示差 d ≤ 0 再 softmax
+      （拆听用交换率净额；其它退向用效用差，若已不低于最优则压
+      ``from_tenpai_ev_min``），避免唯一合格切显示 100%、其余 0% 的失真。
     """
     eligible = [c for c in cands if not c.get("policy_rejected")]
     if not eligible:
         return
-    weights = softmax_weights(
-        [_cand_utility(c) for c in eligible], DEFAULT_TEMPERATURE
+    best_elig = max(
+        eligible,
+        key=lambda c: (
+            _cand_utility(c),
+            _cand_winp(c),
+            _cand_tenpai(c),
+            _cand_ev(c),
+        ),
     )
-    for c, w in zip(eligible, weights):
-        c["recommendation_weight"] = w
+    best_u = _cand_utility(best_elig)
+    display: List[float] = []
     for c in cands:
-        if c.get("policy_rejected"):
-            c["recommendation_weight"] = MIN_RECOMMENDATION_WEIGHT
+        if not c.get("policy_rejected"):
+            display.append(_cand_utility(c))
+            continue
+        # 未合格：构造 ≤0 的显示差（相对 best_elig），与副露 skip 基准 0 同构
+        if _cand_shanten(best_elig) == 0 and _cand_shanten(c) > 0:
+            d = min(0.0, _retreat_exchange_net(best_elig, c))
+        else:
+            d = min(0.0, _cand_utility(c) - best_u)
+            if d >= 0.0:
+                d = -RETREAT_FROM_TENPAI_EV_MIN
+        display.append(best_u + d)
+    weights = softmax_weights(display, DEFAULT_TEMPERATURE)
+    for c, w in zip(cands, weights):
+        c["recommendation_weight"] = w
 
 
 def _nanikiru_reachable(nanikiru_url: str, timeout: float = 2.0) -> bool:
@@ -799,7 +849,12 @@ def _attach_defense(dp: DecisionPoint, analysis: Dict[str, Any]) -> Dict[str, An
             c["policy_rejected"] = id(c) not in valid_ids
         picked = max(
             valid,
-            key=lambda c: (_cand_utility(c), _cand_uke(c), _cand_ev(c)),
+            key=lambda c: (
+                _cand_utility(c),
+                _cand_winp(c),
+                _cand_tenpai(c),
+                _cand_ev(c),
+            ),
         )
         best = picked.get("tile") if picked else None
         classified = classify_discard_match(cands, dp.actual_discard, best)

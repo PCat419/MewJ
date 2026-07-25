@@ -170,6 +170,10 @@ PARAMS = {
         "util_uke_coef": 180.0,
         "util_tenpai_coef": 800.0,
         "util_win_coef": 1200.0,
+        # 同向听进攻效用：EV + 和率×win_scale + 听牌率×tenpai_scale。
+        # 交换率含义：1pp 和率 ≈ win_scale/100 点 EV；高和率能否翻盘取决于 ΔEV 与 Δ和率的相对大小，无绝对 EV 门槛。
+        "near_tie_win_scale": 1000.0,
+        "near_tie_tenpai_scale": 200.0,
         # 高向听烂牌的役牌单张保有补正：δ=(向听−2)×base×活牌比例（≥该向听才补）
         "yakuhai_keep_base": 60.0,
         "yakuhai_keep_min_shanten": 4,
@@ -218,8 +222,13 @@ PARAMS = {
     # ------------------------------------------------------------------
     "review": {
         "retreat": {
-            # 拆听（0→1 向听）的 EV 增益单独门槛：和了率不降或增益 ≥ 该值才放行
+            # 拆听（0→1）：和率不降则放行；和率下降时用
+            # ΔEV + Δ和率×win_scale + Δ听牌率×tenpai_scale ≥ 0 动态过闸。
+            # 无和率统计时回退到 from_tenpai_ev_min。
+            # win_scale 高于同向听破局（和率在听牌态更贵：先制/立直/罚符）。
             "from_tenpai_ev_min": 800.0,
+            "from_tenpai_win_scale": 8000.0,
+            "from_tenpai_tenpai_scale": 500.0,
             # 普通退向 EV 门槛：min(cap, base + per_turn×(巡−5)) × (1 + gap_coef×(深度−1))
             "delta_ev_base": 50.0,
             "delta_ev_per_turn": 20.0,

@@ -30,7 +30,6 @@ from .params import PARAMS as _P
 from .scoring import (
     DEFAULT_TEMPERATURE,
     EQUIVALENT_UTILITY_EPSILON,
-    MIN_RECOMMENDATION_WEIGHT,
     normalize_tile,
     softmax_weights,
 )
@@ -132,7 +131,8 @@ def _rescore_maneuver(
     rest = [c for c in candidates if id(c) not in elig_ids]
     rest.sort(key=lambda c: -_as_float(c.get("recommendation_weight")))
     for c in rest:
-        c["recommendation_weight"] = MIN_RECOMMENDATION_WEIGHT
+        # 线外不占权重份额，保证合格池 softmax 之和仍为 100%
+        c["recommendation_weight"] = 0.0
     return eligible + rest
 
 
@@ -164,7 +164,8 @@ def _rescore_keiten(
     rest = [c for c in candidates if id(c) not in elig_ids]
     rest.sort(key=lambda c: -_as_float(c.get("recommendation_weight")))
     for c in rest:
-        c["recommendation_weight"] = MIN_RECOMMENDATION_WEIGHT
+        # 线外不占权重份额，保证合格池 softmax 之和仍为 100%
+        c["recommendation_weight"] = 0.0
     return eligible + rest
 
 

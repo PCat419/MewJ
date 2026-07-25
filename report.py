@@ -30,6 +30,8 @@ def _fmt_weight(value) -> str:
     try:
         v = float(value)
         percent = v * 100
+        if percent <= 0:
+            return "0%"
         if 0 < percent < 0.01:
             return "<0.01%"
         if percent < 0.1:
