@@ -1,0 +1,6 @@
+# MewJ 运行依赖
+requests>=2.28
+# 雀魂牌谱下载链路（vendor/tensoul 的运行依赖，来自 tensoul 的 pyproject/requirements）
+ms-api>=0.10.275
+aiohttp>=3.8.4
+websockets>=12.0

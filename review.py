@@ -1,0 +1,1120 @@
+"""Analyze decision points via mahjong-cpp (nanikiru) and build Classic report data."""
+
+from __future__ import annotations
+
+import atexit
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
+
+import requests
+
+from .converter import build_request, id_to_tile_name, tile_name_to_id  # noqa: E402
+from .defense import compute_defense, deal_in_for_tile  # noqa: E402
+from .params import PARAMS as _P  # noqa: E402
+from .posture import Posture, advance, apply_posture, evaluate_posture  # noqa: E402
+from .replay import CallOpportunity, DecisionPoint, extract_kyoku_views  # noqa: E402
+from .scoring import (  # noqa: E402
+    ACCEPTABLE_WEIGHT_RATIO,
+    DEFAULT_TEMPERATURE,
+    EQUIVALENT_UTILITY_EPSILON,
+    MIN_RECOMMENDATION_WEIGHT,
+    classify_discard_match,
+    offensive_desire_from_dp,
+    order_candidates,
+    score_candidates,
+    softmax_weights,
+)
+
+_MEWJ_ROOT = Path(__file__).resolve().parent
+
+DEFAULT_NANIKIRU = "http://127.0.0.1:50000"
+MAHJONG_CPP_VERSION = "0.9.8"
+
+
+def _default_nanikiru_exe() -> Path:
+    """定位 nanikiru.exe：环境变量 > MewJ/engine/ > 仓库级 mahjong-cpp 构建目录。"""
+    env = os.environ.get("MEWJ_NANIKIRU_EXE")
+    candidates = []
+    if env:
+        candidates.append(Path(env))
+    candidates.append(_MEWJ_ROOT / "engine" / "nanikiru.exe")
+    candidates.append(
+        _MEWJ_ROOT.parent
+        / "mahjong-cpp"
+        / "build"
+        / "src"
+        / "server"
+        / "nanikiru.exe"
+    )
+    for path in candidates:
+        if path.is_file():
+            return path
+    return candidates[0] if env else candidates[1]
+
+
+DEFAULT_NANIKIRU_EXE = _default_nanikiru_exe()
+
+# Preferred flag order for client requests. Server also forces shanten_down=off
+# when shanten >= 3; this fallback covers stack-overflow on awkward 0-2 shanten hands.
+# Final (False, False) is last-resort when even single-flag modes still crash/hang.
+_FLAG_ATTEMPTS: Tuple[Tuple[bool, bool], ...] = (
+    (True, True),
+    (True, False),
+    (False, True),
+    (False, False),
+)
+
+# Transport failures that usually mean nanikiru died or hung mid-request.
+_NANIKIRU_TRANSPORT_ERRORS: Tuple[type, ...] = (
+    requests.exceptions.ConnectionError,
+    requests.exceptions.Timeout,
+    requests.exceptions.ChunkedEncodingError,
+)
+
+
+def _at_turn(arr: Any, turn: int) -> Any:
+    """Pick stats for absolute turn ``turn``.
+
+    Arrays are indexed 0..t_max. Index 0 is the post-discard / pre-draw slot
+    (usually 0). Index t is the value when the game clock is turn t — same as
+    setting 巡目=t in backend/templates/index.html (t_min=1 → idx=t).
+    """
+    if not arr:
+        return None
+    if turn is None or turn < 0:
+        turn = 1
+    idx = min(max(int(turn), 0), len(arr) - 1)
+    if idx == 0 and len(arr) > 1:
+        idx = 1
+    return arr[idx]
+
+
+def _uke_count(stat: dict) -> int:
+    total = 0
+    for nt in stat.get("necessary_tiles") or []:
+        try:
+            total += int(nt.get("count") or 0)
+        except (TypeError, ValueError):
+            pass
+    return total
+
+
+def _norm_tile_name(tile: Optional[str]) -> str:
+    if not tile:
+        return ""
+    t = str(tile)
+    if t.lower().endswith("r"):
+        t = t[:-1]
+    if t and t[0] == "0":
+        return "5" + t[1:]
+    return t
+
+
+def _strip_river_marker(tile: str) -> str:
+    """Drop trailing 'r' riichi marker; keep aka (0m/0p/0s)."""
+    t = str(tile).strip()
+    if t.lower().endswith("r"):
+        t = t[:-1]
+    return t
+
+
+def _aka_equiv_key(tile: str) -> str:
+    t = _strip_river_marker(tile)
+    if t and t[0] == "0":
+        return "5" + t[1:]
+    return t
+
+
+def _remove_one_seen(seen: List[str], tile: str) -> bool:
+    """Remove one river copy that matches ``tile`` (aka ↔ 5)."""
+    key = _aka_equiv_key(tile)
+    for i, t in enumerate(seen):
+        if _aka_equiv_key(t) == key:
+            del seen[i]
+            return True
+    return False
+
+
+def _wall_inputs_from_dp(dp: DecisionPoint) -> Tuple[List[str], List[dict]]:
+    """Build ``seen`` + ``other_melds`` for nanikiru wall counting.
+
+    Replay keeps called tiles in the discarder's river, while melds also list
+    them — drop those river copies so they are not subtracted twice.
+    """
+    seen: List[str] = []
+    for river in (dp.rivers or {}).values():
+        for t in river or []:
+            name = _strip_river_marker(t)
+            if name:
+                seen.append(name)
+
+    other_melds: List[dict] = []
+    for rel, melds in (dp.melds_by_rel or {}).items():
+        for m in melds or []:
+            mtype = m.get("type")
+            # Open-call tile stays in our simulated river; melds also list it.
+            if (
+                mtype in ("chii", "pon", "daiminkan", "kakan")
+                and m.get("calledTile")
+                and m.get("sourceSeat")
+            ):
+                _remove_one_seen(seen, str(m["calledTile"]))
+            if rel == "自家":
+                continue
+            tiles = m.get("tiles") or []
+            if tiles:
+                other_melds.append({"type": mtype, "tiles": list(tiles)})
+    return seen, other_melds
+
+
+def _own_discard_set(dp: DecisionPoint) -> set:
+    """自家现物：牌河 + 被他家副露走的自家打出牌（与旧前端 computeOwnDiscards 一致）。"""
+    out = set()
+    for t in (dp.rivers or {}).get("自家") or []:
+        key = _norm_tile_name(t)
+        if key:
+            out.add(key)
+    for rel, melds in (dp.melds_by_rel or {}).items():
+        if rel == "自家":
+            continue
+        for m in melds or []:
+            if m.get("sourceSeat") == "自家" and m.get("calledTile"):
+                key = _norm_tile_name(m.get("calledTile"))
+                if key:
+                    out.add(key)
+    return out
+
+
+def _filter_furiten_waits(
+    necessary: List[dict], own_discards: set
+) -> tuple:
+    """0向听：保留自摸进张，只标记振听。"""
+    out = []
+    uke = 0
+    hit = False
+    for nt in necessary:
+        item = dict(nt)
+        key = _norm_tile_name(item.get("tile"))
+        if key and key in own_discards:
+            hit = True
+            item["furiten_wait"] = True
+        else:
+            item["furiten_wait"] = False
+        try:
+            uke += int(item.get("count") or 0)
+        except (TypeError, ValueError):
+            pass
+        out.append(item)
+    return out, uke, hit
+
+
+def _mark_uke_furiten_risk(
+    necessary: List[dict], own_discards: set
+) -> tuple:
+    """非0向听：牌河同种进张仅作提示，不从自摸进张中扣除。"""
+    out = []
+    uke = 0
+    has_risk = False
+    for nt in necessary:
+        item = dict(nt)
+        key = _norm_tile_name(item.get("tile"))
+        try:
+            cnt = int(item.get("count") or 0)
+        except (TypeError, ValueError):
+            cnt = 0
+        if key and key in own_discards:
+            item["risk"] = True
+            has_risk = True
+        else:
+            item["risk"] = False
+        uke += cnt
+        out.append(item)
+    return out, uke, has_risk
+
+
+def _cand_uke(c: dict) -> int:
+    try:
+        return int(c.get("uke") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _delta_ev_min(turn: int, shanten_gap: int) -> float:
+    """Minimum EV gain required to accept a higher-shanten (退向) cut."""
+    r = _P["review"]["retreat"]
+    t = max(1, int(turn or 1))
+    base = min(
+        float(r["delta_ev_cap"]),
+        float(r["delta_ev_base"]) + float(r["delta_ev_per_turn"]) * max(0, t - 5),
+    )
+    gap = max(1, int(shanten_gap))
+    # Deeper retreats need more EV compensation.
+    return base * (1.0 + float(r["delta_ev_gap_coef"]) * (gap - 1))
+
+
+def _tenpai_rate_min(turn: int, shanten_gap: int) -> float:
+    """Minimum tenpai-rate for the 退向 candidate."""
+    r = _P["review"]["retreat"]
+    t = max(1, int(turn or 1))
+    base = min(
+        float(r["tenpai_rate_cap"]),
+        float(r["tenpai_rate_base"])
+        + float(r["tenpai_rate_per_turn"]) * max(0, t - 5),
+    )
+    gap = max(1, int(shanten_gap))
+    return min(
+        float(r["tenpai_rate_hard_cap"]),
+        base + float(r["tenpai_rate_per_gap"]) * (gap - 1),
+    )
+
+
+def _cand_ev(c: dict) -> float:
+    v = c.get("exp_score")
+    return float(v) if v is not None else -1e18
+
+
+def _cand_tenpai(c: dict) -> float:
+    v = c.get("tenpai_prob")
+    return float(v) if v is not None else 0.0
+
+
+def _cand_winp(c: dict) -> float:
+    v = c.get("win_prob")
+    return float(v) if v is not None else 0.0
+
+
+def _cand_shanten(c: dict) -> int:
+    s = c.get("shanten")
+    return int(s) if s is not None else 99
+
+
+# 拆听（0→1 向听）的 EV 增益单独门槛：听牌的先制/罚符/流局价值不体现在
+# EV 差中，只有足够大的改良补偿才允许放弃听牌。
+RETREAT_FROM_TENPAI_EV_MIN = float(_P["review"]["retreat"]["from_tenpai_ev_min"])
+
+
+def _allows_retreat(
+    advance: dict,
+    candidate: dict,
+    turn: int,
+) -> bool:
+    """Whether ``candidate`` (higher shanten) may beat ``advance`` (最低向听).
+
+    拆听（从 0 向听退向）是质变而非程度差异，单独判定：和了率不降
+    （改良为真）或 EV 增益 ≥ RETREAT_FROM_TENPAI_EV_MIN 才放行。
+    其余退向沿用按巡目/深度递进的 EV 与听牌率阈值。
+    """
+    gap = _cand_shanten(candidate) - _cand_shanten(advance)
+    if gap <= 0:
+        return True
+    delta = _cand_ev(candidate) - _cand_ev(advance)
+    if _cand_shanten(advance) == 0:
+        improves_win = 0.0 < _cand_winp(advance) <= _cand_winp(candidate)
+        return improves_win or delta >= RETREAT_FROM_TENPAI_EV_MIN
+    need_ev = _delta_ev_min(turn, gap)
+    need_ten = _tenpai_rate_min(turn, gap)
+    return delta >= need_ev and _cand_tenpai(candidate) >= need_ten
+
+
+def pick_recommended(
+    candidates: List[dict],
+    turn: int,
+    *,
+    use_ev: bool = True,
+) -> Optional[str]:
+    """Choose suggested discard among 进取 + allowed 退向 cuts.
+
+    Take the best EV among: minimum-shanten cuts, plus any higher-shanten cut
+    that clears the turn/gap 退向 bar against the best 进取 cut.
+    """
+    if not candidates:
+        return None
+    if not use_ev:
+        return candidates[0].get("tile")
+
+    min_s = min(_cand_shanten(c) for c in candidates)
+    advance_pool = [c for c in candidates if _cand_shanten(c) == min_s]
+    advance_pool.sort(
+        key=lambda c: (
+            1 if c.get("furiten") else 0,
+            -_cand_uke(c),
+            -_cand_ev(c),
+            -_cand_tenpai(c),
+            c.get("tile") or "",
+        )
+    )
+    a = advance_pool[0]
+
+    allowed = [c for c in advance_pool if not c.get("furiten")] or list(advance_pool)
+    for c in candidates:
+        if _cand_shanten(c) <= min_s:
+            continue
+        if _allows_retreat(a, c, turn):
+            allowed.append(c)
+
+    allowed.sort(
+        key=lambda c: (
+            1 if c.get("furiten") else 0,
+            -_cand_uke(c),
+            -_cand_ev(c),
+            -_cand_tenpai(c),
+            _cand_shanten(c),
+            c.get("tile") or "",
+        )
+    )
+    return allowed[0].get("tile")
+
+
+def _cand_utility(c: dict) -> float:
+    try:
+        return float(c.get("adjusted_utility"))
+    except (TypeError, ValueError):
+        v = c.get("exp_score")
+        return float(v) if v is not None else -1e18
+
+
+def _policy_valid_candidates(candidates: List[dict], turn: int) -> List[dict]:
+    """进取（最低向听）候选 + 过闸退向候选。
+
+    与 pick_recommended 同一套门控：拆听须过专项门控（win_p 不降或
+    EV 增益 ≥800），其余退向须过巡目/深度阈值。供 _attach_defense 在
+    集合内按调整后效用选最优，避免门控被 argmax 架空（原 R1 死代码）。
+    """
+    if not candidates:
+        return []
+    min_s = min(_cand_shanten(c) for c in candidates)
+    advance_pool = [c for c in candidates if _cand_shanten(c) == min_s]
+    advance_pool.sort(
+        key=lambda c: (
+            1 if c.get("furiten") else 0,
+            -_cand_uke(c),
+            -_cand_ev(c),
+            -_cand_tenpai(c),
+            c.get("tile") or "",
+        )
+    )
+    a = advance_pool[0]
+    valid = [c for c in advance_pool if not c.get("furiten")] or list(advance_pool)
+    for c in candidates:
+        if _cand_shanten(c) <= min_s:
+            continue
+        if _allows_retreat(a, c, turn):
+            valid.append(c)
+    return valid
+
+
+def _order_candidates_with_best(
+    candidates: List[dict],
+    best: Optional[str],
+    turn: int = 1,
+    *,
+    use_ev: bool = True,
+) -> List[dict]:
+    """Rank list: recommended first, then policy-valid cuts, then the rest.
+
+    Within each group: lower shanten, then higher (risk-adjusted) uke, then EV.
+    Rejected 退向 cuts sink below same/lower-shanten alternatives.
+    """
+    if not candidates:
+        return candidates
+
+    if not use_ev:
+        ordered = list(candidates)
+        if best:
+            ordered = [c for c in ordered if c.get("tile") == best] + [
+                c for c in ordered if c.get("tile") != best
+            ]
+        return ordered
+
+    min_s = min(_cand_shanten(c) for c in candidates)
+    advance_pool = [c for c in candidates if _cand_shanten(c) == min_s]
+    advance_pool.sort(
+        key=lambda c: (
+            -_cand_uke(c),
+            -_cand_ev(c),
+            -_cand_tenpai(c),
+            c.get("tile") or "",
+        )
+    )
+    a = advance_pool[0]
+
+    def is_policy_valid(c: dict) -> bool:
+        if _cand_shanten(c) <= min_s:
+            return True
+        return _allows_retreat(a, c, turn)
+
+    def sort_key(c: dict):
+        tile = c.get("tile")
+        return (
+            0 if best and tile == best else 1,
+            0 if is_policy_valid(c) else 1,
+            _cand_shanten(c),
+            -_cand_uke(c),
+            -_cand_ev(c),
+            -_cand_tenpai(c),
+            tile or "",
+        )
+
+    return sorted(candidates, key=sort_key)
+
+
+def _rescore_policy_pool(cands: List[dict]) -> None:
+    """权重池与推荐资格一致：policy_rejected 候选不进入 softmax 池。
+
+    被门控（拆听/退向阈值）或振听过滤判定不可推荐的候选，显示权重压至
+    MIN_RECOMMENDATION_WEIGHT（<0.01%，沿用 posture._rescore_maneuver 的既有
+    范式）；行内 EV/效用等数值照常显示。一致/尚可分类在调用本函数前已完成，
+    统计口径不受影响。
+    """
+    eligible = [c for c in cands if not c.get("policy_rejected")]
+    if not eligible:
+        return
+    weights = softmax_weights(
+        [_cand_utility(c) for c in eligible], DEFAULT_TEMPERATURE
+    )
+    for c, w in zip(eligible, weights):
+        c["recommendation_weight"] = w
+    for c in cands:
+        if c.get("policy_rejected"):
+            c["recommendation_weight"] = MIN_RECOMMENDATION_WEIGHT
+
+
+def _nanikiru_reachable(nanikiru_url: str, timeout: float = 2.0) -> bool:
+    try:
+        # GET is rejected with 400 by nanikiru; any HTTP response means alive.
+        requests.get(nanikiru_url, timeout=timeout)
+        return True
+    except requests.exceptions.HTTPError:
+        return True
+    except requests.exceptions.RequestException:
+        return False
+
+
+def _nanikiru_port(nanikiru_url: str) -> int:
+    parsed = urlparse(nanikiru_url)
+    if parsed.port:
+        return int(parsed.port)
+    return 50000
+
+
+# 由本进程启动的 nanikiru 句柄；退出时负责关闭（只关自己启动的实例）
+_NANIKIRU_PROC: Optional[subprocess.Popen] = None
+_NANIKIRU_LOG_HANDLE = None
+_ATEXIT_REGISTERED = False
+
+
+def _nanikiru_log_path() -> Path:
+    out_dir = Path(__file__).resolve().parent / "out"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir / "_nanikiru.log"
+
+
+def _shutdown_owned_nanikiru() -> None:
+    """atexit: terminate the nanikiru process started by this process."""
+    global _NANIKIRU_PROC, _NANIKIRU_LOG_HANDLE
+    proc = _NANIKIRU_PROC
+    _NANIKIRU_PROC = None
+    if proc is not None and proc.poll() is None:
+        try:
+            proc.terminate()
+            proc.wait(timeout=3)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    if _NANIKIRU_LOG_HANDLE is not None:
+        try:
+            _NANIKIRU_LOG_HANDLE.close()
+        except Exception:
+            pass
+        _NANIKIRU_LOG_HANDLE = None
+
+
+def _nanikiru_child_env(exe_path: Path) -> dict:
+    """Child env with MSYS2 runtime DLL dirs prepended to PATH (libspdlog etc.)."""
+    env = dict(os.environ)
+    candidates = [
+        exe_path.parent,
+        Path(r"C:\msys64\mingw64\bin"),
+        Path(r"C:\msys64\ucrt64\bin"),
+    ]
+    prepend = [str(p) for p in candidates if p.is_dir()]
+    env["PATH"] = os.pathsep.join(prepend + [env.get("PATH", "")])
+    return env
+
+
+def restart_nanikiru(
+    nanikiru_url: str = DEFAULT_NANIKIRU,
+    exe: Optional[Path] = None,
+) -> bool:
+    """Kill existing nanikiru and start a fresh process. Returns True if reachable."""
+    global _NANIKIRU_PROC, _NANIKIRU_LOG_HANDLE, _ATEXIT_REGISTERED
+    path = Path(exe) if exe else DEFAULT_NANIKIRU_EXE
+    port = _nanikiru_port(nanikiru_url)
+    if not path.is_file():
+        print(f"  [warn] nanikiru.exe not found: {path}", flush=True)
+        return False
+
+    if sys.platform == "win32":
+        subprocess.run(
+            ["taskkill", "/IM", "nanikiru.exe", "/F"],
+            capture_output=True,
+            check=False,
+        )
+    else:
+        subprocess.run(["pkill", "-f", "nanikiru"], capture_output=True, check=False)
+
+    if _NANIKIRU_LOG_HANDLE is not None:
+        try:
+            _NANIKIRU_LOG_HANDLE.close()
+        except Exception:
+            pass
+    _NANIKIRU_LOG_HANDLE = open(_nanikiru_log_path(), "a", encoding="utf-8")
+
+    time.sleep(0.4)
+    creationflags = 0
+    if sys.platform == "win32":
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(
+            subprocess, "DETACHED_PROCESS", 0
+        )
+    _NANIKIRU_PROC = subprocess.Popen(
+        [str(path), str(port)],
+        cwd=str(path.parent),
+        stdout=_NANIKIRU_LOG_HANDLE,
+        stderr=subprocess.STDOUT,
+        env=_nanikiru_child_env(path),
+        creationflags=creationflags,
+    )
+    if not _ATEXIT_REGISTERED:
+        atexit.register(_shutdown_owned_nanikiru)
+        _ATEXIT_REGISTERED = True
+    for _ in range(40):
+        time.sleep(0.15)
+        if _nanikiru_reachable(nanikiru_url):
+            return True
+    return False
+
+
+def _parse_response(
+    dp: DecisionPoint,
+    raw: dict,
+    *,
+    enable_tegawari: bool,
+    enable_shanten_down: bool,
+) -> Dict[str, Any]:
+    if not raw.get("success", True) and raw.get("err_msg"):
+        return {"ok": False, "error": raw.get("err_msg"), "raw": raw}
+
+    shanten_info = raw.get("shanten") or {}
+    calc_stats = bool((raw.get("config") or {}).get("calc_stats", True))
+    cfg = raw.get("config") or {}
+    server_teg = cfg.get("enable_tegawari", enable_tegawari)
+    server_sd = cfg.get("enable_shanten_down", enable_shanten_down)
+
+    tile_map = {str(i): id_to_tile_name(i) for i in range(37)}
+    own_discards = _own_discard_set(dp)
+    ranked = []
+    for st in raw.get("stats") or []:
+        tid = st.get("tile")
+        if tid is None or tid == -1:
+            continue
+        name = tile_map.get(str(tid), str(tid))
+        tenpai_arr = st.get("tenpai_prob") or []
+        win_arr = st.get("win_prob") or []
+        exp_arr = st.get("exp_score") or []
+        has_probs = bool(tenpai_arr or win_arr or exp_arr)
+        tenpai = _at_turn(tenpai_arr, dp.turn) if has_probs else None
+        win = _at_turn(win_arr, dp.turn) if has_probs else None
+        exp = _at_turn(exp_arr, dp.turn) if has_probs else None
+        necessary = []
+        for nt in st.get("necessary_tiles") or []:
+            nt_id = nt.get("tile")
+            necessary.append(
+                {
+                    "tile": tile_map.get(str(nt_id), str(nt_id)),
+                    "tile_id": nt_id,
+                    "count": nt.get("count"),
+                }
+            )
+        shanten = st.get("shanten")
+        is_furiten = False
+        has_uke_risk = False
+        if own_discards and shanten == 0:
+            necessary, uke, is_furiten = _filter_furiten_waits(
+                necessary, own_discards
+            )
+        elif own_discards and shanten is not None and shanten != 0:
+            necessary, uke, has_uke_risk = _mark_uke_furiten_risk(
+                necessary, own_discards
+            )
+        else:
+            uke = 0
+            for nt in necessary:
+                try:
+                    uke += int(nt.get("count") or 0)
+                except (TypeError, ValueError):
+                    pass
+        ranked.append(
+            {
+                "tile": name,
+                "tile_id": tid,
+                "shanten": shanten,
+                "tenpai_prob": tenpai,
+                # 按巡完整听牌率数组：罚符模型（noten.py）取末段估计流局时听牌率
+                "tenpai_prob_arr": tenpai_arr if has_probs else None,
+                "win_prob": win,
+                "exp_score": exp,
+                "uke": uke,
+                "necessary_tiles": necessary[:14],
+                "furiten": is_furiten,
+                "uke_risk": has_uke_risk,
+            }
+        )
+
+    if calc_stats and any(c.get("exp_score") is not None for c in ranked):
+        ranked.sort(
+            key=lambda x: (
+                -(x["exp_score"] if x["exp_score"] is not None else -1e18),
+                -(x["tenpai_prob"] if x["tenpai_prob"] is not None else -1),
+                x["shanten"] if x["shanten"] is not None else 99,
+            )
+        )
+        use_ev = True
+    else:
+        ranked.sort(
+            key=lambda x: (
+                x["shanten"] if x["shanten"] is not None else 99,
+                -(x["uke"] or 0),
+            )
+        )
+        use_ev = False
+
+    best = pick_recommended(ranked, dp.turn, use_ev=use_ev)
+    ranked = _order_candidates_with_best(
+        ranked, best, dp.turn, use_ev=use_ev
+    )
+    return {
+        "ok": True,
+        "shanten": shanten_info,
+        "calc_stats": calc_stats,
+        "stat_turn": dp.turn,
+        "enable_tegawari": bool(server_teg),
+        "enable_shanten_down": bool(server_sd),
+        "best": best,
+        "actual": dp.actual_discard,
+        "match": best == dp.actual_discard if best else None,
+        "candidates": ranked,
+        "hand": dp.hand,
+        "melds": dp.melds,
+    }
+
+
+def _attach_defense(dp: DecisionPoint, analysis: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach relative danger, adjusted utility and normalized weights."""
+    try:
+        defense = compute_defense(dp)
+        signals_by_seat = {
+            seat: list(model.get("signals") or [])
+            for seat, model in (defense.get("per_seat") or {}).items()
+            if model.get("signals")
+        }
+        analysis["defense"] = {
+            "has_threat": defense["has_threat"],
+            "threats": defense["threats"],
+            "alphas": defense["alphas"],
+            "metric": defense["metric"],
+            "calibrated": defense["calibrated"],
+            "signals_by_seat": signals_by_seat,
+        }
+        for c in analysis.get("candidates") or []:
+            row = deal_in_for_tile(defense, c.get("tile") or "")
+            c["deal_in"] = row
+            c["relative_danger"] = row
+            # Compatibility alias. The value is a relative index, not a
+            # calibrated probability; new code should use relative_danger.
+            c["deal_in_prob"] = row.get("combined")
+            tile = _norm_tile_name(c.get("tile") or "")
+            reasons = []
+            for seat, model in (defense.get("per_seat") or {}).items():
+                factor = (model.get("modifiers") or {}).get(tile)
+                if factor is None:
+                    continue
+                matched = [
+                    signal
+                    for signal in (model.get("signals") or [])
+                    if tile in (signal.get("tiles") or [])
+                ]
+                reasons.append(
+                    {
+                        "seat": seat,
+                        "factor": factor,
+                        "direction": "up" if factor > 1.0 else "down",
+                        "rules": [
+                            {
+                                "id": signal.get("id"),
+                                "label": signal.get("label"),
+                                "factor": signal.get("factor"),
+                            }
+                            for signal in matched
+                        ],
+                    }
+                )
+            c["danger_reasons"] = reasons
+    except Exception as exc:
+        analysis["defense_error"] = str(exc)
+        defense = {
+            "has_threat": False,
+            "threats": [],
+            "alphas": {},
+            "per_seat": {},
+            "combined": {},
+        }
+
+    cands = analysis.get("candidates") or []
+    if analysis.get("ok") and cands:
+        desire_info = offensive_desire_from_dp(dp)
+        score_candidates(
+            cands,
+            defense,
+            dp,
+            offensive_desire=desire_info["offensive_desire"],
+            # 罚符模型上下文：威胁列表 + 当前巡目（stat_turn 在 analysis 里）。
+            # 用局部 defense（异常回退时 threats=[]），不读 analysis["defense"]
+            noten_ctx={
+                "threats": defense.get("threats") or [],
+                "turn": analysis.get("stat_turn"),
+            },
+        )
+        # 门控生效（修复 R1 死代码）：best 只在 policy-valid 集合内按调整后
+        # 效用 argmax；被门控拒绝的退向候选标记 policy_rejected 并沉底展示。
+        valid = _policy_valid_candidates(cands, dp.turn)
+        valid_ids = {id(c) for c in valid}
+        for c in cands:
+            c["policy_rejected"] = id(c) not in valid_ids
+        picked = max(
+            valid,
+            key=lambda c: (_cand_utility(c), _cand_uke(c), _cand_ev(c)),
+        )
+        best = picked.get("tile") if picked else None
+        classified = classify_discard_match(cands, dp.actual_discard, best)
+        # 一致/尚可分类完成后重算权重池：被门控/振听过滤的候选权重压至 ≈0，
+        # 保证任何卡片中 推荐项 == 权重最高候选（统计口径不变）
+        _rescore_policy_pool(cands)
+        analysis["best"] = best
+        analysis["equivalent_best"] = classified["equivalent_best"]
+        analysis["match"] = classified["match"]
+        analysis["match_kind"] = classified["match_kind"]
+        ordered = order_candidates(cands)
+        ordered.sort(key=lambda c: 1 if c.get("policy_rejected") else 0)
+        analysis["candidates"] = ordered
+        analysis["recommendation_model"] = {
+            "name": "risk-adjusted-softmax",
+            "danger_metric": "relative_danger",
+            "calibrated": False,
+            "temperature": DEFAULT_TEMPERATURE,
+            "minimum_weight": MIN_RECOMMENDATION_WEIGHT,
+            "equivalent_utility_epsilon": EQUIVALENT_UTILITY_EPSILON,
+            "acceptable_weight_ratio": ACCEPTABLE_WEIGHT_RATIO,
+            # Hidden score-situation knob; not rendered in the Classic report UI.
+            "offensive_desire": desire_info,
+        }
+    return analysis
+
+
+# 振听补偿：nanikiru 的请求不含牌河信息，引擎无法感知振听，
+# 会把自家已舍牌种的剩余枚数照常计入待牌/进张价值（如切过 8m 仍高估 6m7m 搭子）。
+# 修正：将自家牌河出现过的牌种剩余枚数一律置 0（含对应红五槽）。
+#   - 只处理自家（rel=="自家"）的舍牌；他家舍牌与自家振听无关，不动
+#   - 舍牌振听整局永久有效，故每个决策点按当时牌河全量置 0
+#   - 已知近似：该牌种的自摸分支一并被抹除（wall 整数计数下的最近似）
+_FIVE_RED_PAIR = {4: 34, 13: 35, 22: 36, 34: 4, 35: 13, 36: 22}  # 5m/5p/5s <-> 红五槽
+
+
+def _apply_furiten_wall_zero(req: Dict[str, Any], dp: DecisionPoint) -> None:
+    wall = req.get("wall")
+    if not isinstance(wall, list):
+        return
+    n = len(wall)
+    for entry in (dp.discards_log or []):
+        if entry.get("rel") != "自家":
+            continue
+        try:
+            tid = tile_name_to_id(entry.get("tile") or "")
+        except ValueError:
+            continue
+        for t in (tid, _FIVE_RED_PAIR.get(tid)):
+            if t is not None and 0 <= t < n:
+                wall[t] = 0
+
+
+def analyze_decision(
+    dp: DecisionPoint,
+    *,
+    nanikiru_url: str = DEFAULT_NANIKIRU,
+    timeout: float = 30.0,
+    enable_tegawari: bool = True,
+    enable_shanten_down: bool = True,
+) -> Dict[str, Any]:
+    """Call nanikiru and return efficiency, relative danger and recommendation."""
+    seen, other_melds = _wall_inputs_from_dp(dp)
+    req = build_request(
+        game_mode=1,
+        round_wind=dp.round_wind,
+        seat_wind=dp.seat_wind,
+        dora_indicators=dp.dora_indicators,
+        hand=dp.hand,
+        melds=[{"type": m["type"], "tiles": m["tiles"]} for m in dp.melds],
+        other_melds=other_melds,
+        seen=seen,
+        t_min=1,
+        t_max=18,
+        version=MAHJONG_CPP_VERSION,
+        enable_tegawari=enable_tegawari,
+        enable_shanten_down=enable_shanten_down,
+    )
+    _apply_furiten_wall_zero(req, dp)
+    resp = requests.post(nanikiru_url, json=req, timeout=timeout)
+    resp.raise_for_status()
+    analysis = _parse_response(
+        dp,
+        resp.json(),
+        enable_tegawari=enable_tegawari,
+        enable_shanten_down=enable_shanten_down,
+    )
+    if analysis.get("ok"):
+        _attach_defense(dp, analysis)
+    return analysis
+
+
+
+def analyze_decision_resilient(
+    dp: DecisionPoint,
+    *,
+    nanikiru_url: str = DEFAULT_NANIKIRU,
+    timeout: float = 30.0,
+) -> Dict[str, Any]:
+    """Analyze with old-project defaults; on nanikiru crash/hang, restart and fall back.
+
+    Some hands stack-overflow or hang when tegawari / shanten_down are on.
+    Keep 手替 whenever possible (disable 向听回退 first); last resort turns both off.
+    """
+    last_exc: Optional[BaseException] = None
+    for i, (teg, sd) in enumerate(_FLAG_ATTEMPTS):
+        try:
+            return analyze_decision(
+                dp,
+                nanikiru_url=nanikiru_url,
+                timeout=timeout,
+                enable_tegawari=teg,
+                enable_shanten_down=sd,
+            )
+        except _NANIKIRU_TRANSPORT_ERRORS as exc:
+            last_exc = exc
+            kind = "超时" if isinstance(exc, requests.exceptions.Timeout) else "断开"
+            print(
+                f"    nanikiru {kind}（手替={teg} 向听回退={sd}），尝试重启…",
+                flush=True,
+            )
+            if i + 1 >= len(_FLAG_ATTEMPTS):
+                break
+            if not restart_nanikiru(nanikiru_url):
+                raise RuntimeError(
+                    "nanikiru 崩溃后无法重启。请检查 nanikiru.exe 路径"
+                    "（环境变量 MEWJ_NANIKIRU_EXE 或 MewJ/engine/nanikiru.exe）"
+                ) from exc
+    assert last_exc is not None
+    raise RuntimeError(
+        "nanikiru 在多种参数下均崩溃/断开，无法分析该手。"
+    ) from last_exc
+
+
+def review_paipu(
+    paipu: dict,
+    seat: int,
+    *,
+    kyoku_indices: Optional[List[int]] = None,
+    max_turns: Optional[int] = None,
+    nanikiru_url: str = DEFAULT_NANIKIRU,
+    skip_analyze: bool = False,
+) -> dict:
+    """Build Classic-style review payload for one seat."""
+    from . import call_eval  # 延迟 import：call_eval 依赖本模块，避免循环
+
+    views = extract_kyoku_views(paipu, seat, include_calls=True)
+    if kyoku_indices is not None:
+        selected = set(kyoku_indices)
+        views = [v for v in views if v.index in selected]
+
+    total = sum(len(v.decisions) for v in views)
+    if max_turns is not None:
+        total = min(total, max_turns)
+    if not skip_analyze:
+        if not _nanikiru_reachable(nanikiru_url):
+            print("nanikiru 未就绪，尝试启动…", flush=True)
+            if not restart_nanikiru(nanikiru_url):
+                raise RuntimeError(
+                    f"nanikiru 未运行或无法连接: {nanikiru_url}\n"
+                    "请手动启动 nanikiru，或设置 MEWJ_NANIKIRU_EXE / "
+                    "将 nanikiru.exe 放到 MewJ/engine/ 后重试，或重新运行 review.bat。"
+                )
+        print(f"共 {total} 个决策点，开始调用 nanikiru（默认手替开）…", flush=True)
+
+    report_kyokus = []
+    analyzed = 0
+    for view in views:
+        decisions_out = []
+        # 攻防姿态：每局从全牌效开始，局内只能 全牌效→兜牌→全弃 单调前进
+        posture = Posture.FULL_EFFICIENCY
+        for dp in view.decisions:
+            if isinstance(dp, CallOpportunity):
+                # 副露决策点：碰/吃 vs 跳过的反事实评估（不动 posture）
+                entry = {
+                    "kind": "call",
+                    "label": dp.label,
+                    "turn": dp.turn,
+                    "hand": dp.hand,
+                    "melds": dp.melds,
+                    "disc_tile": dp.disc_tile,
+                    "discarder_rel": dp.discarder_rel,
+                    "actual": dp.actual,
+                    "actual_tiles": dp.actual_tiles,
+                    "actual_cut": dp.actual_cut,
+                    "legal_summary": {
+                        "pon": len((dp.legal or {}).get("pon") or []),
+                        "chii": len((dp.legal or {}).get("chii") or []),
+                        "daiminkan": bool((dp.legal or {}).get("daiminkan")),
+                    },
+                    "analysis": None,
+                    "skipped": False,
+                }
+                if max_turns is not None and analyzed >= max_turns:
+                    entry["skipped"] = True
+                elif not skip_analyze:
+                    analyzed += 1
+                    print(f"  [{analyzed}/{total}] {dp.label} …", flush=True)
+                    try:
+                        # 形听轴语境：当前姿态 + 威胁/危险查询能力（CallOpportunity
+                        # 与 DecisionPoint 防守字段同名，compute_defense 鸭子类型适用；
+                        # 无防守数据时 risk_lookup=None，形听轴自动禁用）
+                        call_threats = None
+                        call_risk_lookup = None
+                        call_defense = None
+                        try:
+                            call_defense = compute_defense(dp)
+                            call_threats = call_defense.get("threats") or []
+
+                            def call_risk_lookup(tile, _d=call_defense):
+                                v = deal_in_for_tile(_d, tile or "").get("combined")
+                                return float(v) if v is not None else 0.0
+
+                        except Exception:
+                            call_threats, call_risk_lookup, call_defense = (
+                                None,
+                                None,
+                                None,
+                            )
+                        ev = call_eval.evaluate_opportunity(
+                            dp,
+                            nanikiru_url,
+                            posture=posture,
+                            threats=call_threats,
+                            defense=call_defense,
+                        )
+                        decision = call_eval.decide(ev, risk_lookup=call_risk_lookup)
+                        match = (
+                            call_eval.match_actual(dp.actual, decision)
+                            if ev.get("ok")
+                            else None
+                        )
+                        entry["analysis"] = {
+                            **ev,
+                            **decision,
+                            "match": match,
+                            "match_kind": (
+                                "same"
+                                if match is True
+                                else "different"
+                                if match is False
+                                else None
+                            ),
+                        }
+                    except Exception as exc:
+                        entry["analysis"] = {"ok": False, "error": str(exc)}
+                decisions_out.append(entry)
+                continue
+
+            if max_turns is not None and analyzed >= max_turns:
+                decisions_out.append(
+                    {
+                        "kind": "discard",
+                        "label": dp.label,
+                        "turn": dp.turn,
+                        "hand": dp.hand,
+                        "drawn_tile": dp.drawn_tile,
+                        "melds": dp.melds,
+                        "actual": dp.actual_discard,
+                        "is_riichi": dp.is_riichi_discard,
+                        "is_tsumogiri": dp.is_tsumogiri,
+                        "analysis": None,
+                        "skipped": True,
+                    }
+                )
+                continue
+
+            entry = {
+                "kind": "discard",
+                "label": dp.label,
+                "turn": dp.turn,
+                "hand": dp.hand,
+                "drawn_tile": dp.drawn_tile,
+                "melds": dp.melds,
+                "dora": dp.dora_indicators,
+                "round_wind": dp.round_wind,
+                "seat_wind": dp.seat_wind,
+                "actual": dp.actual_discard,
+                "is_riichi": dp.is_riichi_discard,
+                "is_tsumogiri": dp.is_tsumogiri,
+                "analysis": None,
+                "skipped": False,
+            }
+            if not skip_analyze:
+                analyzed += 1
+                print(f"  [{analyzed}/{total}] {dp.label} …", flush=True)
+                try:
+                    entry["analysis"] = analyze_decision_resilient(
+                        dp, nanikiru_url=nanikiru_url
+                    )
+                    ana = entry["analysis"]
+                    if ana.get("ok"):
+                        posture = advance(posture, evaluate_posture(ana))
+                        posture = apply_posture(ana, posture)
+                except Exception as exc:
+                    entry["analysis"] = {"ok": False, "error": str(exc)}
+            decisions_out.append(entry)
+
+        report_kyokus.append(
+            {
+                "index": view.index,
+                "label": view.label,
+                "scores": view.scores,
+                "dora": view.dora_indicators,
+                "seat_wind": view.seat_wind,
+                "result": view.result,
+                "decisions": decisions_out,
+            }
+        )
+
+    return {
+        "title": paipu.get("title"),
+        "ref": paipu.get("ref"),
+        "names": paipu.get("name"),
+        "seat": seat,
+        "player": (paipu.get("name") or [None] * 4)[seat],
+        "kyokus": report_kyokus,
+    }

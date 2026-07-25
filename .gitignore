@@ -1,0 +1,9 @@
+out/
+paipu/
+.env
+__pycache__/
+*.pyc
+.venv/
+# 引擎运行时在 engine/ 旁写的日志与崩溃转储
+engine/log.txt
+engine/crash_*.txt
