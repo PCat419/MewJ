@@ -7,6 +7,8 @@
 
 分派规则：
 - 例外（保持全牌效）：手牌期望值极高，或自家 4 位且大比分落后；
+- 4 位拒绝全弃：all-last 任意 4 位至少兜牌；每多剩一局，拒绝全弃所需
+  分差按 ``fourth_no_fold_per_remaining`` 递增（早巡小分差落后仍可全弃）；
 - 兜牌：0 向听，或 1 向听且强度不错（EV 不低且进张多）——只打低风险牌维持向听
   （0 向听时允许退向至 1 向听，但拆听须过门控：和了率不降 / EV 增益足够 /
   显著更安全三选一，防止为微薄 EV 放弃听牌）；
@@ -51,6 +53,52 @@ POSTURE_LABELS = {
 
 # 经验参数统一存于 params.py（此处仅为兼容别名）
 POSTURE_CONFIG = _P["posture"]
+
+
+def remaining_kyoku(
+    kyoku_idx: Any,
+    *,
+    last_kyoku: Optional[int] = None,
+) -> int:
+    """半庄剩余预定局数；南4/西入后为 0。"""
+    last = int(POSTURE_CONFIG["hanchan_last_kyoku"] if last_kyoku is None else last_kyoku)
+    try:
+        idx = int(kyoku_idx)
+    except (TypeError, ValueError):
+        idx = 0
+    return max(0, last - idx)
+
+
+def fourth_no_fold_margin(
+    remaining: int,
+    config: Optional[Dict[str, Any]] = None,
+) -> float:
+    """4 位拒绝全弃的分差门槛（margin ≤ 该值则至少兜牌）。
+
+    all-last（remaining=0）且 base=0 → 门槛为 0（任意 4 位不全弃）；
+    每多剩一局，所需落后分差增加 ``fourth_no_fold_per_remaining``。
+    """
+    cfg = config or POSTURE_CONFIG
+    base = _as_float(cfg.get("fourth_no_fold_base"), 0.0)
+    per = _as_float(cfg.get("fourth_no_fold_per_remaining"), 2000.0)
+    return -(base + max(0, int(remaining)) * per)
+
+
+def fourth_should_not_fold(
+    desire: Dict[str, Any],
+    config: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """自家约 4 位且分差达到（随剩余局数缩放的）门槛 → 禁止全弃。"""
+    cfg = config or POSTURE_CONFIG
+    rank = _as_float(desire.get("average_rank"), 2.5)
+    if rank < 3.5:
+        return False
+    margin = _as_float(desire.get("margin"), 0.0)
+    if "remaining_kyoku" in desire:
+        remaining = max(0, int(_as_float(desire.get("remaining_kyoku"), 0.0)))
+    else:
+        remaining = remaining_kyoku(desire.get("kyoku"))
+    return margin <= fourth_no_fold_margin(remaining, cfg)
 
 
 def _as_float(value: Any, default: float = 0.0) -> float:
@@ -224,6 +272,7 @@ def evaluate_posture(
     desire = (analysis.get("recommendation_model") or {}).get("offensive_desire") or {}
     rank = _as_float(desire.get("average_rank"), 2.5)
     margin = _as_float(desire.get("margin"), 0.0)
+    no_fold = fourth_should_not_fold(desire, cfg)
 
     min_s, hand_ev, hand_uke = _hand_strength(candidates)
 
@@ -288,6 +337,9 @@ def evaluate_posture(
     # 但全弃以「有牌可弃」为前提：≥1 张完全安牌（危险度=0，即对所有威胁家
     # 均为现物/绝对安全），或 ≥2 张极低危牌才允许全弃；安全存量不足时留在
     # 兜牌（盲弃等于闭着眼睛打牌，不如维持向听打最低危险牌）。
+    # 4 位 + 分差达到剩余局数门槛时拒绝全弃，至少兜牌追分。
+    if no_fold:
+        return Posture.MANEUVER
     zero_risk = [c for c in candidates if _cand_risk(c) <= 1e-9]
     if zero_risk:
         return Posture.FOLD
@@ -375,6 +427,8 @@ def apply_posture(
 
     actual = analysis.get("actual")
     final = posture
+    desire = (analysis.get("recommendation_model") or {}).get("offensive_desire") or {}
+    no_fold = fourth_should_not_fold(desire, cfg)
 
     if posture is Posture.MANEUVER:
         threats = trigger_threats(analysis.get("defense") or {}, cfg)
@@ -412,6 +466,7 @@ def apply_posture(
                 def _retreat_ok(c: Dict[str, Any]) -> bool:
                     if _cand_shanten(c) == 0:
                         return True
+                    # 保听软惩罚已在出牌层写入效用；此处仅交换率/安全阀
                     if 0.0 < a_winp <= _cand_winp(c):
                         return True
                     if _cand_ev(c) - a_ev >= ev_min:
@@ -419,6 +474,21 @@ def apply_posture(
                     return _cand_risk(c) <= a_risk - margin
 
                 eligible = [c for c in eligible if _retreat_ok(c)]
+        if not eligible and no_fold:
+            # 4 位追分禁止降级全弃：放宽危险上限，在同向听里打相对最安全的牌
+            eligible = [
+                c
+                for c in candidates
+                if _cand_shanten(c) <= max_s and not c.get("furiten")
+            ]
+            eligible.sort(
+                key=lambda c: (
+                    _cand_risk(c),
+                    -_cand_utility(c),
+                    -_cand_ev(c),
+                    str(c.get("tile") or ""),
+                )
+            )
         if not eligible:
             # 维持向听的牌全部超危险上限 → 降级全弃（单调前进，允许）
             final = Posture.FOLD
@@ -445,6 +515,16 @@ def apply_posture(
             for c in candidates
             if _cand_shanten(c) <= min_s and _cand_risk(c) <= k_cap
         ]
+        if not eligible and no_fold:
+            eligible = [c for c in candidates if _cand_shanten(c) <= min_s]
+            eligible.sort(
+                key=lambda c: (
+                    _cand_risk(c),
+                    -_as_float(c.get("noten_credit")),
+                    -_cand_utility(c),
+                    str(c.get("tile") or ""),
+                )
+            )
         if not eligible:
             # 保听池为空 → 降级全弃（单调前进，允许；全弃覆盖逻辑照常生效，
             # 符合「全弃状态下不考虑形听」）
@@ -457,7 +537,29 @@ def apply_posture(
             # 分类口径仿兜牌：实切在保听池内即「尚可」，最优/等价按效用 ε 判定
             analysis.update(_classify_maneuver(eligible, pick, actual))
 
-    if final is Posture.FOLD:
+    if final is Posture.FOLD and no_fold:
+        # 评估阶段已判追分，或兜牌/形听空池：强制留在兜牌，不进入全弃
+        final = Posture.MANEUVER
+        min_s = min(_cand_shanten(c) for c in candidates)
+        eligible = [
+            c
+            for c in candidates
+            if _cand_shanten(c) <= min_s and not c.get("furiten")
+        ] or list(candidates)
+        eligible.sort(
+            key=lambda c: (
+                _cand_risk(c),
+                -_cand_utility(c),
+                -_cand_ev(c),
+                str(c.get("tile") or ""),
+            )
+        )
+        ordered = _rescore_maneuver(candidates, eligible)
+        pick = ordered[0]
+        analysis["best"] = pick.get("tile")
+        analysis["candidates"] = ordered
+        analysis.update(_classify_maneuver(eligible, pick, actual))
+    elif final is Posture.FOLD:
         ordered = sorted(
             candidates,
             key=lambda c: (

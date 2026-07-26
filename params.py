@@ -23,8 +23,11 @@ PARAMS = {
     # 威胁建模（defense.py）
     # ------------------------------------------------------------------
     "defense": {
-        # 副露威胁的放铳置信系数（副露数越多越可能已听牌；立直恒为 1.0）
+        # 副露威胁的放铳置信系数上限（副露数越多越可能已听牌；立直恒为 1.0）
+        # 1/2 副露的实际 α = 上限 × min(1, 巡目/furo_alpha_full_turn)；3/4 副露不缩放
         "furo_alphas": {1: 0.20, 2: 0.40, 3: 0.70, 4: 1.00},
+        # 1/2 副露威胁度爬满所需巡目（≥ 该巡取上限）
+        "furo_alpha_full_turn": 12,
     },
     # ------------------------------------------------------------------
     # 危险度信号系数（defense_heuristics.py，乘算后归一化）
@@ -69,6 +72,12 @@ PARAMS = {
         "high_ev": 5000.0,
         # 4 位且落后领先者达到该值 → 全牌效（不写死防守）
         "despair_margin": -15000.0,
+        # 半庄预定终局局索引（东1=0 … 南4=7）；西入后 kyoku>7 视为 remaining=0
+        "hanchan_last_kyoku": 7,
+        # 4 位拒绝全弃（地板兜牌）的分差门槛：margin ≤ -(base + remaining×per)
+        # all-last（remaining=0）且 base=0 → 任意 4 位不全弃；每多剩 1 局需再落后 per
+        "fourth_no_fold_base": 0.0,
+        "fourth_no_fold_per_remaining": 2000.0,
         # 兜牌对手牌强度的要求（1 向听时）
         "maneuver_min_ev": 2000.0,
         "maneuver_min_uke": 12,
@@ -239,10 +248,20 @@ PARAMS = {
     # ------------------------------------------------------------------
     "review": {
         "retreat": {
-            # 拆听（0→1）：和率不降则放行；和率下降时用
-            # ΔEV + Δ和率×win_scale + Δ听牌率×tenpai_scale ≥ 0 动态过闸。
-            # 无和率统计时回退到 from_tenpai_ev_min。
-            # win_scale 高于同向听破局（和率在听牌态更贵：先制/立直/罚符）。
+            # 拆听软惩罚（不硬拒）：听牌 EV 相对满罚阈值 K 爬升，
+            # EV≥K（或 ≥lock_turn 巡）→ 惩罚打满 soft_cap（近乎保听）；
+            # 未达 K 时越接近惩罚越高。巡目/激进只调惩罚倍率，不移动 K。
+            # K=8000：愚形听 ~5k 仍在软区；满贯档期望才满罚。
+            # 软区从 2000 起爬到 K（width = K − 2000 = 6000）。
+            "from_tenpai_keep_ev": 8000.0,
+            "from_tenpai_keep_soft_width": 6000.0,
+            "from_tenpai_keep_soft_cap": 1800.0,
+            "from_tenpai_keep_lock_turn": 9,
+            # 惩罚倍率：1.0 中性；每早 1 巡（相对 lock−1）×减免；desire 高→减免
+            "from_tenpai_keep_early_relief": 0.04,
+            "from_tenpai_keep_desire_relief": 0.30,
+            "from_tenpai_keep_scale_min": 0.40,
+            "from_tenpai_keep_scale_max": 1.25,
             "from_tenpai_ev_min": 800.0,
             "from_tenpai_win_scale": 8000.0,
             "from_tenpai_tenpai_scale": 500.0,

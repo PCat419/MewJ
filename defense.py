@@ -4,7 +4,9 @@ Threats: riichi and/or open-meld opponents only (no damaten).
 Genbutsu cutoff: riichi declaration seq, or last discard after first open meld.
 Riichi: visible tiles + wait shapes + suji priors.
 Furo: danger rises with the number of open melds; four melds force tanki.
-Combined: weighted soft-OR (α_riichi=1, α_furo depends on meld count).
+1/2 副露的 α 随巡目线性爬升，至 furo_alpha_full_turn（默认 12）达上限；
+3/4 副露与立直不缩放。
+Combined: weighted soft-OR (α_riichi=1, α_furo depends on meld count × turn).
 
 Values are normalized relative-danger indices, not calibrated deal-in rates.
 """
@@ -20,6 +22,7 @@ from .params import PARAMS
 from .replay import DecisionPoint
 
 FURO_ALPHAS = PARAMS["defense"]["furo_alphas"]
+FURO_ALPHA_FULL_TURN = PARAMS["defense"]["furo_alpha_full_turn"]
 THREAT_SEATS = ("下家", "对家", "上家")
 _OPEN_TYPES = frozenset({"chii", "pon", "daiminkan", "kakan"})
 ALL_TILES: List[str] = (
@@ -204,15 +207,30 @@ def _collect_threats(dp: DecisionPoint) -> List[Dict[str, Any]]:
     return threats
 
 
-def _alphas(threats: List[Dict[str, Any]]) -> Dict[str, float]:
-    return {
-        t["seat"]: (
-            FURO_ALPHAS.get(int(t.get("furo_count") or 1), FURO_ALPHAS[1])
-            if t["kind"] == "furo"
-            else 1.0
-        )
-        for t in threats
-    }
+def _furo_turn_scale(furo_count: int, turn: float) -> float:
+    """1/2 副露威胁度随巡目线性爬升；≥3 副露不缩放。"""
+    if int(furo_count) >= 3:
+        return 1.0
+    cap = float(FURO_ALPHA_FULL_TURN) or 12.0
+    if cap <= 0:
+        return 1.0
+    try:
+        t = float(turn)
+    except (TypeError, ValueError):
+        t = 0.0
+    return max(0.0, min(1.0, t / cap))
+
+
+def _alphas(threats: List[Dict[str, Any]], turn: float) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    for t in threats:
+        if t["kind"] != "furo":
+            out[t["seat"]] = 1.0
+            continue
+        fc = int(t.get("furo_count") or 1)
+        base = FURO_ALPHAS.get(fc, FURO_ALPHAS[1])
+        out[t["seat"]] = float(base) * _furo_turn_scale(fc, turn)
+    return out
 
 
 def compute_defense(dp: DecisionPoint) -> Dict[str, Any]:
@@ -220,6 +238,10 @@ def compute_defense(dp: DecisionPoint) -> Dict[str, Any]:
     threats = _collect_threats(dp)
     remaining = wall_remaining(dp)
     log = dp.discards_log or []
+    try:
+        turn = float(getattr(dp, "turn", 0) or 0)
+    except (TypeError, ValueError):
+        turn = 0.0
 
     per_seat: Dict[str, Dict[str, Any]] = {}
     for th in threats:
@@ -264,7 +286,7 @@ def compute_defense(dp: DecisionPoint) -> Dict[str, Any]:
             "modifier_bounds": heuristic["bounds"],
         }
 
-    alphas = _alphas(threats)
+    alphas = _alphas(threats, turn)
     combined: Dict[str, Optional[float]] = {}
     if not threats:
         for t in ALL_TILES:

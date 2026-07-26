@@ -431,7 +431,13 @@ def compute_offensive_desire(
 
 
 def offensive_desire_from_dp(dp: Any) -> Dict[str, Any]:
-    return compute_offensive_desire(_scores_from_dp(dp), getattr(dp, "seat", 0))
+    info = compute_offensive_desire(_scores_from_dp(dp), getattr(dp, "seat", 0))
+    meta = getattr(dp, "kyoku_meta", None) or []
+    kyoku = _as_int(meta[0]) if meta else 0
+    last = _as_int((_P.get("posture") or {}).get("hanchan_last_kyoku"), 7)
+    info["kyoku"] = kyoku
+    info["remaining_kyoku"] = max(0, last - kyoku)
+    return info
 
 
 def score_candidates(
