@@ -177,6 +177,15 @@ PARAMS = {
         # 高向听烂牌的役牌单张保有补正：δ=(向听−2)×base×活牌比例（≥该向听才补）
         "yakuhai_keep_base": 60.0,
         "yakuhai_keep_min_shanten": 4,
+        # 直线七对近并列微调：七对≤2 且比一般型少 ≥gap 向、无威胁时，
+        # 仅在相对最优 EV 落后 ≤band 的最低向听候选上，用 isolation/tanki/筋
+        # 小幅重排；tiebreak_max 须明显小于 band，避免盖过候牌枚数 EV。
+        "chiitoitsu_straight_gap": 2,
+        "chiitoitsu_near_tie_band": 200.0,
+        "chiitoitsu_tiebreak_max": 40.0,
+        "chiitoitsu_keep_iso_weight": 0.55,
+        "chiitoitsu_keep_tanki_weight": 0.25,
+        "chiitoitsu_keep_suji_weight": 0.20,
     },
     # ------------------------------------------------------------------
     # 副露判断（call_eval.py）：碰/吃 vs 跳过的反事实评估

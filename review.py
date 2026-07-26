@@ -495,13 +495,14 @@ def _retreat_exchange_net(advance: dict, candidate: dict) -> float:
 
 
 def _rescore_policy_pool(cands: List[dict]) -> None:
-    """显示权重：全体候选进 softmax（和为 100%），判定资格不变。
+    """显示权重与综合效用：全体进 softmax（和为 100%），判定资格不变。
 
-    对齐副露报告口径（call_eval）：判定用门控选 best；权重仅作显示校准。
-    - 合格候选：用 ``adjusted_utility``；
-    - 未过闸：相对最优合格切的显示差 d ≤ 0 再 softmax
+    对齐副露报告口径（call_eval）：判定用门控选 best；权重/综合效用仅作显示校准。
+    - 合格候选：保留 ``adjusted_utility``；
+    - 未过闸：相对最优合格切的显示差 d ≤ 0，写回 ``adjusted_utility`` 再 softmax
       （拆听用交换率净额；其它退向用效用差，若已不低于最优则压
-      ``from_tenpai_ev_min``），避免唯一合格切显示 100%、其余 0% 的失真。
+      ``from_tenpai_ev_min``），保证推荐项综合效用排第一，且避免 100%/0% 失真。
+    牌效 EV（``exp_score``）仍显示引擎原值，不受影响。
     """
     eligible = [c for c in cands if not c.get("policy_rejected")]
     if not eligible:
@@ -530,7 +531,8 @@ def _rescore_policy_pool(cands: List[dict]) -> None:
                 d = -RETREAT_FROM_TENPAI_EV_MIN
         display.append(best_u + d)
     weights = softmax_weights(display, DEFAULT_TEMPERATURE)
-    for c, w in zip(cands, weights):
+    for c, u, w in zip(cands, display, weights):
+        c["adjusted_utility"] = u
         c["recommendation_weight"] = w
 
 
@@ -661,7 +663,10 @@ def _parse_response(
     if not raw.get("success", True) and raw.get("err_msg"):
         return {"ok": False, "error": raw.get("err_msg"), "raw": raw}
 
-    shanten_info = raw.get("shanten") or {}
+    from .call_eval import apply_shanten_gate, hand_without_tile, local_shanten
+
+    n_meld = len(dp.melds or [])
+    shanten_info = apply_shanten_gate(raw.get("shanten") or {}, n_meld)
     calc_stats = bool((raw.get("config") or {}).get("calc_stats", True))
     cfg = raw.get("config") or {}
     server_teg = cfg.get("enable_tegawari", enable_tegawari)
@@ -692,7 +697,11 @@ def _parse_response(
                     "count": nt.get("count"),
                 }
             )
+        # 切后向听按本地口径（七对/国士仅 ≤2）；失败时回退引擎值
         shanten = st.get("shanten")
+        after = hand_without_tile(dp.hand or [], name)
+        if after is not None:
+            shanten = local_shanten(after, n_meld)
         is_furiten = False
         has_uke_risk = False
         if own_discards and shanten == 0:

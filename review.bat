@@ -22,15 +22,16 @@ if not exist ".env" (
     exit /b 0
 )
 
-set /p SOURCE=Paipu JSON path or Majsoul link: 
+set /p SOURCE=Paipu UUID or Majsoul link: 
 if "%SOURCE%"=="" (
     echo Empty input.
     pause
     exit /b 1
 )
 
-set /p SEAT=Seat 0-3 [0]: 
-if "%SEAT%"=="" set SEAT=0
+set /p SEAT=Seat 0-3 [auto from URL]: 
+set "SEAT_ARGS="
+if not "%SEAT%"=="" set "SEAT_ARGS=--seat %SEAT%"
 
 set "NANIKIRU_PORT=50000"
 set "STARTED_NANIKIRU=0"
@@ -87,11 +88,11 @@ echo nanikiru is ready.
 :after_nanikiru
 echo.
 
-echo %SOURCE%| findstr /i /c:".json" >nul
+echo %SOURCE%| findstr /i /c:"http" /c:"paipu=" >nul
 if not errorlevel 1 (
-    python "%~dp0cli.py" "%SOURCE%" --seat %SEAT% --open
+    python "%~dp0cli.py" --link "%SOURCE%" %SEAT_ARGS% --open
 ) else (
-    python "%~dp0cli.py" --link "%SOURCE%" --seat %SEAT% --open
+    python "%~dp0cli.py" "%SOURCE%" %SEAT_ARGS% --open
 )
 set ERR=%ERRORLEVEL%
 echo.

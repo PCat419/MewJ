@@ -411,7 +411,7 @@ class MajsoulPaipuDownloader:
             detail="invalid MAJSOUL_ACCESS_TOKEN or oauth type",
         )
 
-    async def download(self, record_uuid: str):
+    async def download(self, record_uuid: str, target_account_id: int | None = None):
         req = pb.ReqGameRecord()
         req.game_uuid = record_uuid
         req.client_version_string = self.client_version_string
@@ -420,9 +420,9 @@ class MajsoulPaipuDownloader:
         if res.error.code:
             raise MajsoulDownloadError(code=res.error.code)
 
-        return self._handle_game_record(res)
+        return self._handle_game_record(res, target_account_id=target_account_id)
 
-    def _handle_game_record(self, record):
+    def _handle_game_record(self, record, target_account_id: int | None = None):
         res = {}
         ruledisp = ""
         lobby = ""
@@ -477,6 +477,16 @@ class MajsoulPaipuDownloader:
         res["name"] = ["AI"] * nplayers
         for e in record.head.accounts:
             res["name"][e.seat] = e.nickname
+
+        # Keep account ids by seat so share-link ``_a…`` can map to actor later.
+        res["account_ids"] = [0] * nplayers
+        for e in record.head.accounts:
+            res["account_ids"][e.seat] = int(getattr(e, "account_id", 0) or 0)
+        if target_account_id is not None:
+            for e in record.head.accounts:
+                if int(getattr(e, "account_id", 0) or 0) == int(target_account_id):
+                    res["_target_actor"] = int(e.seat)
+                    break
 
         scores = [[e.seat, e.part_point_1, e.total_point / 1000] for e in record.head.result.players]
         res["sc"] = [0] * nplayers * 2

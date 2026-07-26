@@ -52,6 +52,14 @@ YAKUHAI_KEEP_MIN_SHANTEN = _S["yakuhai_keep_min_shanten"]
 NEAR_TIE_WIN_SCALE = _S["near_tie_win_scale"]
 NEAR_TIE_TENPAI_SCALE = _S["near_tie_tenpai_scale"]
 
+# 直线七对近并列微调
+CHIITOITSU_STRAIGHT_GAP = _S["chiitoitsu_straight_gap"]
+CHIITOITSU_NEAR_TIE_BAND = _S["chiitoitsu_near_tie_band"]
+CHIITOITSU_TIEBREAK_MAX = _S["chiitoitsu_tiebreak_max"]
+CHIITOITSU_KEEP_ISO_WEIGHT = _S["chiitoitsu_keep_iso_weight"]
+CHIITOITSU_KEEP_TANKI_WEIGHT = _S["chiitoitsu_keep_tanki_weight"]
+CHIITOITSU_KEEP_SUJI_WEIGHT = _S["chiitoitsu_keep_suji_weight"]
+
 
 def _as_float(value: Any, default: float = 0.0) -> float:
     try:
@@ -160,6 +168,164 @@ def apply_near_tie_win_break(
         tenpai = min(1.0, max(0.0, _as_float(c.get("tenpai_prob"))))
         out[i] = out[i] + win * win_scale + tenpai * tenpai_scale
     return out
+
+
+def _suit_neighbors(tile: str) -> List[str]:
+    """同花色 ±1、±2 邻张（字牌为空）。"""
+    if len(tile) < 2 or tile[1] == "z":
+        return []
+    try:
+        d = int(tile[0])
+    except ValueError:
+        return []
+    suit = tile[1]
+    return [f"{n}{suit}" for n in (d - 2, d - 1, d + 1, d + 2) if 1 <= n <= 9]
+
+
+def _own_discard_kinds(dp: Any) -> set:
+    """自家牌河牌种集合（去 r、红五归一）。"""
+    out = set()
+    for t in (getattr(dp, "rivers", None) or {}).get("自家") or []:
+        nt = normalize_tile(t)
+        if nt:
+            out.add(nt)
+    return out
+
+
+def _suji_wait_boost(tile: str, own_discards: set) -> float:
+    """候听 ``tile`` 是否被自家牌河完全激活筋（0 或 1）。
+
+    边张 123/789 需一端；中张 456 需两端都打过。
+    """
+    if len(tile) < 2 or tile[1] == "z":
+        return 0.0
+    try:
+        d = int(tile[0])
+    except ValueError:
+        return 0.0
+    suit = tile[1]
+
+    def _has(n: int) -> bool:
+        return f"{n}{suit}" in own_discards
+
+    if d in (1, 2, 3):
+        return 1.0 if _has(d + 3) else 0.0
+    if d in (7, 8, 9):
+        return 1.0 if _has(d - 3) else 0.0
+    if d in (4, 5, 6):
+        return 1.0 if _has(d - 3) and _has(d + 3) else 0.0
+    return 0.0
+
+
+def _chiitoitsu_keep_raw(
+    tile: str,
+    remaining: Dict[str, int],
+    own_discards: set,
+) -> float:
+    """单张保有原始分 ∈[0,1] 量级：isolation / tanki / suji 加权。"""
+    w_iso = _as_float(CHIITOITSU_KEEP_ISO_WEIGHT, 0.55)
+    w_tanki = _as_float(CHIITOITSU_KEEP_TANKI_WEIGHT, 0.25)
+    w_suji = _as_float(CHIITOITSU_KEEP_SUJI_WEIGHT, 0.20)
+    self_live = max(0, min(3, int(remaining.get(tile, 0))))
+    tanki = self_live / 3.0
+    if len(tile) >= 2 and tile[1] == "z":
+        isolation = 1.0
+        suji = 0.0
+    else:
+        neighbors = _suit_neighbors(tile)
+        if neighbors:
+            nb_live = sum(max(0, int(remaining.get(n, 0))) for n in neighbors)
+            isolation = 1.0 - nb_live / float(4 * len(neighbors))
+            isolation = min(1.0, max(0.0, isolation))
+        else:
+            isolation = 1.0
+        suji = _suji_wait_boost(tile, own_discards)
+    return w_iso * isolation + w_tanki * tanki + w_suji * suji
+
+
+def build_chiitoitsu_tiebreak_penalties(
+    candidates: List[Dict[str, Any]],
+    defense: Optional[Dict[str, Any]],
+    dp: Any,
+) -> Dict[str, float]:
+    """直线七对近并列：切牌 → 效用扣减。不触发时返回空 dict。
+
+    触发：门清、七对≤2 且比一般型少 ≥gap 向、无威胁。
+    仅对最低向听且 EV 落后 ≤band 的候选扣分；只评价手牌单张。
+    """
+    defense = defense or {}
+    if defense.get("threats"):
+        return {}
+    melds = getattr(dp, "melds", None) or []
+    if melds:
+        return {}
+    hand = list(getattr(dp, "hand", None) or [])
+    if not hand:
+        return {}
+
+    # 懒加载：call_eval 依赖 review/scoring，避免循环 import
+    from .call_eval import SPECIAL_HAND_SHANTEN_MAX, form_shanten_parts
+
+    regular, seven_pairs, _orphans = form_shanten_parts(hand, 0)
+    gap = max(1, _as_int(CHIITOITSU_STRAIGHT_GAP, 2))
+    if seven_pairs > SPECIAL_HAND_SHANTEN_MAX:
+        return {}
+    if regular - seven_pairs < gap:
+        return {}
+
+    own: Dict[str, int] = {}
+    for t in hand:
+        nt = normalize_tile(t)
+        if nt:
+            own[nt] = own.get(nt, 0) + 1
+
+    remaining = defense.get("remaining")
+    if not isinstance(remaining, dict) or not remaining:
+        from .defense import wall_remaining
+
+        try:
+            remaining = wall_remaining(dp)
+        except Exception:
+            return {}
+
+    own_discards = _own_discard_kinds(dp)
+    band = max(0.0, _as_float(CHIITOITSU_NEAR_TIE_BAND, 200.0))
+    tmax = max(0.0, _as_float(CHIITOITSU_TIEBREAK_MAX, 40.0))
+    if tmax <= 0:
+        return {}
+
+    min_s = min((_as_int(c.get("shanten"), 99) for c in candidates), default=99)
+    best_ev = None
+    for c in candidates:
+        if _as_int(c.get("shanten"), 99) != min_s:
+            continue
+        if c.get("exp_score") is None:
+            continue
+        ev = _as_float(c.get("exp_score"))
+        if best_ev is None or ev > best_ev:
+            best_ev = ev
+    if best_ev is None:
+        return {}
+
+    # 按候选 tile 建罚分：同牌多候选取同一 raw；band 外为 0
+    penalties: Dict[str, float] = {}
+    for c in candidates:
+        tile = normalize_tile(c.get("tile"))
+        if not tile or own.get(tile, 0) != 1:
+            penalties[tile] = 0.0
+            continue
+        if _as_int(c.get("shanten"), 99) != min_s:
+            penalties[tile] = 0.0
+            continue
+        if c.get("exp_score") is None:
+            penalties[tile] = 0.0
+            continue
+        if best_ev - _as_float(c.get("exp_score")) > band:
+            penalties[tile] = 0.0
+            continue
+        raw = _chiitoitsu_keep_raw(tile, remaining, own_discards)
+        penalties[tile] = tmax * raw
+    return penalties
 
 
 def softmax_weights(
@@ -378,6 +544,9 @@ def score_candidates(
             noten_ctx.get("threats"), noten_ctx.get("turn"), _N
         )
 
+    # ---- 直线七对近并列微调（无威胁 + gap≥2 时对难利用/筋单张小幅保有）----
+    chiitoitsu_tb = build_chiitoitsu_tiebreak_penalties(candidates, defense, dp)
+
     utilities: List[float] = []
     base_offenses: List[float] = []
     for candidate in candidates:
@@ -431,6 +600,9 @@ def score_candidates(
         keep_penalty = yakuhai_keep.get(tile, 0.0)
         if keep_penalty:
             utility -= keep_penalty
+        chiitoitsu_tiebreak = _as_float(chiitoitsu_tb.get(tile))
+        if chiitoitsu_tiebreak:
+            utility -= chiitoitsu_tiebreak
         # 罚符信用加项（仿 yakuhai_keep 模式）：保听有奖、弃听有罚；
         # 未启用时恒为 0.0，保证报告列稳定
         if noten_packed is not None:
@@ -447,6 +619,7 @@ def score_candidates(
         candidate["risk_cost"] = risk_cost
         candidate["risk_cost_scaled"] = scaled_risk
         candidate["yakuhai_keep_penalty"] = keep_penalty
+        candidate["chiitoitsu_tiebreak"] = chiitoitsu_tiebreak
         candidate["noten_credit"] = noten_credit
         candidate["noten_components"] = noten_components
         candidate["adjusted_utility"] = utility

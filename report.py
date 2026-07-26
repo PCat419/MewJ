@@ -632,7 +632,7 @@ def render_classic_html(report: dict, tile_base: str = "../assets/tiles") -> str
             for tid, short, st in nav_items
         )
         side_groups.append(
-            '<details class="side-group">'
+            f'<details class="side-group" data-kyoku="k{ky.get("index")}">'
             f'<summary class="side-kyoku">'
             f'<span class="side-kyoku-main">{_esc(main_label)}</span>'
             + (f'<span class="side-kyoku-sub">{_esc(sub_label)}</span>' if sep else "")
@@ -1024,12 +1024,22 @@ function exclusiveDetails(selector, scopeFn) {{
   }});
 }}
 
+function syncSideToKyoku(kyoku) {{
+  if (!kyoku || !kyoku.id) return;
+  document.querySelectorAll('aside.side details.side-group').forEach(function (g) {{
+    g.open = (g.getAttribute('data-kyoku') === kyoku.id);
+  }});
+}}
+
 function openTurnById(id) {{
   if (!id) return null;
   var turn = document.getElementById(id);
   if (!turn || !turn.classList.contains('turn')) return null;
   var kyoku = turn.closest('details.kyoku');
-  if (kyoku) kyoku.open = true;
+  if (kyoku) {{
+    kyoku.open = true;
+    syncSideToKyoku(kyoku);
+  }}
   // Close siblings first so later scroll isn't shifted by collapsing content above.
   document.querySelectorAll('details.turn').forEach(function (el) {{
     if (el !== turn) el.open = false;
@@ -1066,8 +1076,28 @@ function revealTurn(id) {{
 
 // 目录：一次只展开一局
 exclusiveDetails('aside.side details.side-group');
-// 正文：一次只展开一巡（全局，跨局）
-exclusiveDetails('details.turn');
+// 正文：一次只展开一巡（全局，跨局）；展开巡目时同步左侧目录到当局
+document.querySelectorAll('details.turn').forEach(function (el) {{
+  el.addEventListener('toggle', function () {{
+    if (!el.open) return;
+    document.querySelectorAll('details.turn').forEach(function (other) {{
+      if (other !== el) other.open = false;
+    }});
+    var kyoku = el.closest('details.kyoku');
+    if (kyoku) {{
+      kyoku.open = true;
+      syncSideToKyoku(kyoku);
+    }}
+  }});
+}});
+
+// 右侧展开某局时，左侧目录同步切换到当局
+document.querySelectorAll('details.kyoku').forEach(function (el) {{
+  el.addEventListener('toggle', function () {{
+    if (!el.open) return;
+    syncSideToKyoku(el);
+  }});
+}});
 
 // 左侧目录点击：跳转并展开对应巡目
 document.querySelectorAll('.side-turns a[href^="#"]').forEach(function (link) {{
@@ -1105,6 +1135,10 @@ window.addEventListener('hashchange', function () {{
       if (side) side.open = true;
     }}
     revealTurn(hashId);
+  }} else {{
+    // 无锚点时：左侧目录对齐正文当前已展开的第一局
+    var firstKy = document.querySelector('details.kyoku[open]');
+    if (firstKy) syncSideToKyoku(firstKy);
   }}
 }})();
 </script>

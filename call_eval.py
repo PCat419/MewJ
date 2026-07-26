@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import math
 from collections import Counter
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -208,7 +208,7 @@ def _furiten_wall_zero(wall: List[int], self_discards: List[str]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 本地向听数计算（标准形 / 七对 / 国士），用于补齐引擎 shanten 字段
+# 本地向听数计算（标准形 / ≤2向听的七对与国士），用于补齐/门控引擎 shanten 字段
 # ---------------------------------------------------------------------------
 
 _ORPHAN_IDX34 = (0, 8, 9, 17, 18, 26, 27, 28, 29, 30, 31, 32, 33)
@@ -287,19 +287,98 @@ def _thirteen_orphans_shanten(cnt: List[int]) -> int:
     return 13 - uniq - (1 if pair else 0)
 
 
-def local_shanten(hand_tiles: List[str], n_meld: int = 0) -> int:
-    """手牌向听数 = 各和了形最小值（有副露时仅标准形；与引擎 shanten.all 同口径）。"""
-    cnt = [0] * 34
-    for t in hand_tiles:
-        cnt[_tile_name_to_idx34(t)] += 1
-    sh = _regular_shanten(cnt, n_meld)
-    if n_meld == 0:
-        sh = min(sh, _seven_pairs_shanten(cnt), _thirteen_orphans_shanten(cnt))
+# 七对 / 国士仅在此向听及以内才并入综合向听；更远时只走一般型。
+SPECIAL_HAND_SHANTEN_MAX = 2
+
+_AKA_TILE_ALT = {
+    "0m": "5m",
+    "0p": "5p",
+    "0s": "5s",
+    "5m": "0m",
+    "5p": "0p",
+    "5s": "0s",
+}
+
+
+def _fold_special_shanten(regular: int, seven_pairs: int, thirteen_orphans: int) -> int:
+    """一般型向听 + 门清七对/国士（仅 ≤SPECIAL_HAND_SHANTEN_MAX）。"""
+    sh = int(regular)
+    if seven_pairs <= SPECIAL_HAND_SHANTEN_MAX:
+        sh = min(sh, int(seven_pairs))
+    if thirteen_orphans <= SPECIAL_HAND_SHANTEN_MAX:
+        sh = min(sh, int(thirteen_orphans))
     return sh
 
 
+def form_shanten_parts(
+    hand_tiles: List[str], n_meld: int = 0
+) -> Tuple[int, int, int]:
+    """分项向听 ``(regular, seven_pairs, thirteen_orphans)``。
+
+    有副露时七对/国士无意义，后两项返回 99（不参与比较）。
+    """
+    cnt = [0] * 34
+    for t in hand_tiles:
+        cnt[_tile_name_to_idx34(t)] += 1
+    regular = _regular_shanten(cnt, n_meld)
+    if n_meld > 0:
+        return regular, 99, 99
+    return regular, _seven_pairs_shanten(cnt), _thirteen_orphans_shanten(cnt)
+
+
+def local_shanten(hand_tiles: List[str], n_meld: int = 0) -> int:
+    """手牌向听数：有副露仅一般型；门清时一般型与（≤2 向听的）七对/国士取 min。"""
+    regular, seven_pairs, thirteen_orphans = form_shanten_parts(hand_tiles, n_meld)
+    if n_meld > 0:
+        return regular
+    return _fold_special_shanten(regular, seven_pairs, thirteen_orphans)
+
+
+def gated_shanten_all(shanten_info: dict, n_meld: int = 0) -> Optional[int]:
+    """按七对/国士 ≤2 门控重算引擎 ``shanten.all``；缺分项时回退原 ``all``。"""
+    if not shanten_info:
+        return None
+    reg = shanten_info.get("regular")
+    if reg is None:
+        return shanten_info.get("all")
+    if n_meld > 0:
+        return int(reg)
+    sp = shanten_info.get("seven_pairs")
+    to = shanten_info.get("thirteen_orphans")
+    if sp is None or to is None:
+        return shanten_info.get("all")
+    return _fold_special_shanten(int(reg), int(sp), int(to))
+
+
+def apply_shanten_gate(shanten_info: dict, n_meld: int = 0) -> dict:
+    """返回新 dict，``all`` 已按七对/国士 ≤2 门控重写。"""
+    out = dict(shanten_info or {})
+    gated = gated_shanten_all(out, n_meld)
+    if gated is not None:
+        out["all"] = gated
+    return out
+
+
+def hand_without_tile(hand: List[str], tile: str) -> Optional[List[str]]:
+    """从手牌移除一张（普通/赤五可互换兜底）；失败返回 None。"""
+    after = list(hand)
+    if tile in after:
+        after.remove(tile)
+        return after
+    alt = _AKA_TILE_ALT.get(tile)
+    if alt and alt in after:
+        after.remove(alt)
+        return after
+    return None
+
+
 def _build_cut_candidates(
-    raw: dict, turn: int, self_discards: List[str]
+    raw: dict,
+    turn: int,
+    self_discards: List[str],
+    *,
+    hand_tiles: Optional[List[str]] = None,
+    n_meld: int = 0,
 ) -> List[dict]:
     """引擎 stats → 与切牌分析（review._parse_response）同形的候选列表。
 
@@ -307,6 +386,8 @@ def _build_cut_candidates(
     shanten（切后向听）/ uke / furiten——可直接喂给门控与 score_candidates。
     ``tenpai_prob_arr`` 必须保留：罚符模型取数组末段估计流局时听牌率，
     缺省会误用当前巡标量，把拆听高听牌率候选错当成接近保听。
+
+    传入 ``hand_tiles`` 时，切后向听按本地口径重算（七对/国士仅 ≤2 才计入）。
     """
     own = {t for t in (_norm_tile_name(x) for x in (self_discards or [])) if t}
     cands: List[dict] = []
@@ -327,7 +408,12 @@ def _build_cut_candidates(
             if nt_id is None:
                 continue
             necessary.append({"tile": id_to_tile_name(nt_id), "count": nt.get("count")})
+        name = id_to_tile_name(tid)
         shanten = st.get("shanten")
+        if hand_tiles is not None:
+            after = hand_without_tile(hand_tiles, name)
+            if after is not None:
+                shanten = local_shanten(after, n_meld)
         furiten = False
         if own and shanten == 0:
             necessary, uke, furiten = _filter_furiten_waits(necessary, own)
@@ -340,7 +426,7 @@ def _build_cut_candidates(
                     pass
         cands.append(
             {
-                "tile": id_to_tile_name(tid),
+                "tile": name,
                 "exp_score": exp,
                 "win_prob": _at_turn(win_arr, turn) if win_arr else None,
                 "tenpai_prob": _at_turn(ten_arr, turn) if ten_arr else None,
@@ -467,17 +553,20 @@ def _query_best(
             continue
         if raw.get("success", True) is False and raw.get("err_msg"):
             return {"error": raw.get("err_msg")}
-        cands = _build_cut_candidates(raw, turn, self_discards)
+        n_meld = len(melds)
+        cands = _build_cut_candidates(
+            raw, turn, self_discards, hand_tiles=hand_tiles, n_meld=n_meld
+        )
         if not cands:
             return {"error": "no candidates"}
         # 与切牌卡同口径：门控 + 防守调整效用后的最优切（决定本假设的 EV/和率）
         picked = policy_best_cut(cands, turn, opp=opp, defense=defense)
         if picked is None:
             return {"error": "no candidates"}
-        shanten = (raw.get("shanten") or {}).get("all")
+        shanten = gated_shanten_all(raw.get("shanten") or {}, n_meld)
         if shanten is None:
             # 旧引擎响应缺 shanten：本地按同口径补齐
-            shanten = local_shanten(hand_tiles, len(melds))
+            shanten = local_shanten(hand_tiles, n_meld)
         return {
             "ev": picked["exp_score"],
             "win": picked["win_prob"],
@@ -987,8 +1076,7 @@ def decide(
             f"罚符价值{fti['value']:.0f} ≥ {float(p['form_tenpai_value_min']):.0f}，"
             f"危险{fti['danger']:.3f} ≤ {fti['danger_cap']:.2f}）"
         )
-    else:
-        out["basis"] = "双轴与形听轴均未过" if ft is not None else "双轴均未过"
+    # 双轴/形听轴均未过时不写提示（报告侧不展示“依据：双轴均未过”）
 
     # ---- 报告权重（softmax 显示校准，不参与判定） ----
     # 显示效用差 d（相对跳过基准 0），构造性与判定一致：

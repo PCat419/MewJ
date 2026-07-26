@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import List, Optional
+from urllib.parse import parse_qs, urlparse
 
 from .report import write_report
 from .review import DEFAULT_NANIKIRU, review_paipu
@@ -15,6 +17,14 @@ from .review import DEFAULT_NANIKIRU, review_paipu
 MEWJ_ROOT = Path(__file__).resolve().parent
 PAIPU_DIR = MEWJ_ROOT / "paipu"
 OUT_DIR = MEWJ_ROOT / "out"
+
+_PAIPU_UUID_RE = re.compile(
+    r"\d{6}-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+# Majsoul share-link obfuscation (same as Equim-chan/tensoul deobfuse.js)
+_MATCH_OFFSET = (1117113, 1358437)
+_MATCH_XOR = 86216345
+_VIEWER_SUFFIX_RE = re.compile(r"_a(\d+)\b", re.IGNORECASE)
 
 
 def load_dotenv(*paths: Path) -> None:
@@ -32,16 +42,104 @@ def load_dotenv(*paths: Path) -> None:
                 os.environ[key] = value
 
 
+def decode_majsoul_account_id(match_id: int) -> int:
+    """Decode ``_a{match_id}`` from a Majsoul share URL into ``account_id``."""
+    return (((int(match_id) - _MATCH_OFFSET[1]) ^ _MATCH_XOR) - _MATCH_OFFSET[0]) // 7
+
+
+def extract_paipu_ref(text: str) -> tuple[str, Optional[int]]:
+    """Return ``(uuid, account_id_or_None)`` from a share link / UUID / ``*.json`` path.
+
+    ``account_id`` comes from the viewer suffix ``_a…`` when present.
+    """
+    text = text.strip().strip('"').strip("'")
+    if not text:
+        raise ValueError("empty paipu uuid")
+
+    if "paipu=" in text or text.startswith("http"):
+        query = parse_qs(urlparse(text).query)
+        if "paipu" in query:
+            text = query["paipu"][0]
+        else:
+            match = re.search(r"paipu=([^&#]+)", text)
+            if match:
+                text = match.group(1)
+
+    name = Path(text).name
+    if name.lower().endswith(".json"):
+        name = name[:-5]
+
+    account_id: Optional[int] = None
+    viewer = _VIEWER_SUFFIX_RE.search(name) or _VIEWER_SUFFIX_RE.search(text)
+    if viewer:
+        account_id = decode_majsoul_account_id(int(viewer.group(1)))
+
+    name = name.split("_a", 1)[0].strip()
+    match = _PAIPU_UUID_RE.search(name) or _PAIPU_UUID_RE.search(text)
+    if not match:
+        raise ValueError(f"cannot parse paipu UUID from: {text!r}")
+    return match.group(0), account_id
+
+
+def extract_paipu_uuid(text: str) -> str:
+    """Extract record UUID from a share link, bare UUID, or ``*.json`` path stem."""
+    return extract_paipu_ref(text)[0]
+
+
+def resolve_seat_from_paipu(paipu: dict, account_id: Optional[int] = None) -> Optional[int]:
+    """Resolve absolute seat 0-3 from cached ``_target_actor`` / ``account_ids``."""
+    if account_id is not None:
+        ids = paipu.get("account_ids")
+        if isinstance(ids, list):
+            for seat, aid in enumerate(ids):
+                try:
+                    if int(aid) == int(account_id):
+                        return seat
+                except (TypeError, ValueError):
+                    continue
+    target = paipu.get("_target_actor")
+    if target is not None:
+        try:
+            seat = int(target)
+        except (TypeError, ValueError):
+            return None
+        if 0 <= seat <= 3:
+            return seat
+    return None
+
+
+def local_paipu_path(uuid_text: str) -> Path:
+    """Resolve a paipu UUID/link to ``MewJ/paipu/<uuid>.json`` (must exist)."""
+    record_uuid = extract_paipu_uuid(uuid_text)
+    path = PAIPU_DIR / f"{record_uuid}.json"
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"本地牌谱不存在: {path}（请将牌谱放到 MewJ/paipu/ 目录，仅输入 uuid）"
+        )
+    return path
+
+
+def cached_paipu_path(link_or_uuid: str) -> Optional[Path]:
+    """Return ``paipu/<uuid>.json`` if a local cache exists for this link/uuid."""
+    try:
+        record_uuid = extract_paipu_uuid(link_or_uuid)
+    except ValueError:
+        return None
+    path = PAIPU_DIR / f"{record_uuid}.json"
+    return path if path.is_file() else None
+
+
 def resolve_paipu_source(source: str) -> tuple[str, Optional[Path]]:
-    """Return ('file', path) or ('link', None) with raw link/uuid string in source."""
+    """Return ('file', path) or ('link', None) with raw link/uuid string in source.
+
+    Prefer local ``paipu/<uuid>.json`` for both bare UUID and share links.
+    """
     text = source.strip().strip('"').strip("'")
     if not text:
         raise ValueError("empty paipu source")
-    path = Path(text)
-    if path.is_file():
-        return "file", path
-    if path.suffix.lower() == ".json":
-        raise FileNotFoundError(f"paipu file not found: {path}")
+    cached = cached_paipu_path(text)
+    if cached is not None:
+        return "file", cached
     return "link", None
 
 
@@ -56,6 +154,22 @@ async def download_paipu_async(
     force: bool = False,
 ) -> Path:
     """Download Majsoul paipu via tensoul; cache under MewJ/paipu/<uuid>.json."""
+    try:
+        record_uuid, account_id = extract_paipu_ref(link_or_uuid)
+    except ValueError:
+        record_uuid, account_id = None, None
+
+    # Prefer local cache before importing / contacting tensoul.
+    if not force and record_uuid:
+        out_path = cache_dir / f"{record_uuid}.json"
+        if out_path.is_file():
+            # Re-download if URL has a viewer and cache cannot resolve seat yet.
+            if account_id is None or resolve_seat_from_paipu(
+                load_paipu_json(out_path), account_id
+            ) is not None:
+                print(f"使用缓存牌谱: {out_path}", flush=True)
+                return out_path
+
     _ensure_tensoul_importable()
     try:
         from tensoul import (
@@ -70,12 +184,17 @@ async def download_paipu_async(
             "请先在 MewJ 目录执行: pip install -r requirements.txt"
         ) from exc
 
-    record_uuid = parse_paipu_uuid(link_or_uuid)
+    if record_uuid is None:
+        record_uuid = parse_paipu_uuid(link_or_uuid)
+        account_id = extract_paipu_ref(link_or_uuid)[1]
     cache_dir.mkdir(parents=True, exist_ok=True)
     out_path = cache_dir / f"{record_uuid}.json"
     if out_path.is_file() and not force:
-        print(f"使用缓存牌谱: {out_path}", flush=True)
-        return out_path
+        if account_id is None or resolve_seat_from_paipu(
+            load_paipu_json(out_path), account_id
+        ) is not None:
+            print(f"使用缓存牌谱: {out_path}", flush=True)
+            return out_path
 
     username = os.environ.get("MAJSOUL_USERNAME", "").strip()
     password = os.environ.get("MAJSOUL_PASSWORD", "").strip()
@@ -100,7 +219,9 @@ async def download_paipu_async(
             else:
                 await downloader.login(username, password)
             print("正在下载...", flush=True)
-            logs = await downloader.download(record_uuid)
+            logs = await downloader.download(
+                record_uuid, target_account_id=account_id
+            )
     except MajsoulLoginError as exc:
         code = exc.code
         msg = f"登录失败{f'（错误码 {code}）' if code else ''}。"
@@ -180,13 +301,23 @@ def obtain_paipu(
     source: str,
     *,
     force_download: bool = False,
+    local_uuid: bool = False,
 ) -> tuple[dict, Path]:
-    """Load paipu from local JSON or Majsoul link/UUID. Returns (paipu, json_path)."""
-    kind, path = resolve_paipu_source(source)
-    if kind == "file":
-        assert path is not None
+    """Load paipu from local UUID (``paipu/<uuid>.json``) or Majsoul link/UUID.
+
+    Links/UUIDs prefer the local ``paipu/`` cache when present (unless
+    ``force_download``). Returns (paipu, json_path).
+    """
+    if local_uuid:
+        path = local_paipu_path(source)
         print(f"读取本地牌谱: {path}", flush=True)
         return load_paipu_json(path), path
+
+    if not force_download:
+        cached = cached_paipu_path(source)
+        if cached is not None:
+            print(f"读取本地牌谱: {cached}", flush=True)
+            return load_paipu_json(cached), cached
 
     json_path = download_paipu(source.strip(), force=force_download)
     return load_paipu_json(json_path), json_path
@@ -194,25 +325,53 @@ def obtain_paipu(
 
 def run_pipeline(
     source: str,
-    seat: int = 0,
+    seat: Optional[int] = None,
     *,
     kyoku_indices: Optional[List[int]] = None,
     max_turns: Optional[int] = None,
     nanikiru_url: str = DEFAULT_NANIKIRU,
     structure_only: bool = False,
     force_download: bool = False,
+    local_uuid: bool = False,
     output: Optional[Path] = None,
 ) -> Path:
     """
-    Full pipeline: source (link or json) → review → HTML report.
+    Full pipeline: source (link or local uuid) → review → HTML report.
     Returns the written HTML path.
+
+    If ``seat`` is omitted, try Majsoul URL ``_a…`` / cached ``_target_actor``.
     """
     # Prefer MewJ/.env; fall back to tensoul/.env if present
     load_dotenv(MEWJ_ROOT / ".env", MEWJ_ROOT.parent / "tensoul" / ".env")
 
-    paipu, json_path = obtain_paipu(source, force_download=force_download)
+    try:
+        _, account_id = extract_paipu_ref(source)
+    except ValueError:
+        account_id = None
+
+    paipu, json_path = obtain_paipu(
+        source, force_download=force_download, local_uuid=local_uuid
+    )
+
+    if seat is None:
+        seat = resolve_seat_from_paipu(paipu, account_id)
+        if seat is None:
+            seat = 0
+            print(
+                "未能从 URL/_a 或牌谱自动识别座次，默认 seat=0（可用 --seat 指定）",
+                flush=True,
+            )
+        else:
+            print(f"自动识别座次: seat={seat}", flush=True)
+    elif not (0 <= int(seat) <= 3):
+        raise ValueError(f"seat must be 0-3, got {seat!r}")
+    else:
+        seat = int(seat)
+
     ref = paipu.get("ref") or json_path.stem
-    print(f"检讨 {ref} seat={seat} …", flush=True)
+    names = paipu.get("name") or []
+    who = names[seat] if 0 <= seat < len(names) else "?"
+    print(f"检讨 {ref} seat={seat} ({who}) …", flush=True)
 
     report = review_paipu(
         paipu,

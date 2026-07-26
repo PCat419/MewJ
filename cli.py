@@ -1,9 +1,10 @@
 """MewJ CLI — Classic-style paipu review (tile-efficiency).
 
 Examples:
+  python -m MewJ.cli --link "https://game.maj-soul.com/1/?paipu=...._a123"
   python -m MewJ.cli --link "https://game.maj-soul.com/1/?paipu=...._a123" --seat 0
-  python -m MewJ.cli paipu/xxx.json --seat 0 --kyoku 0
-  python -m MewJ.cli xxx.json --seat 0 --structure-only
+  python -m MewJ.cli 260725-06cf78e3-18bc-4730-a4ea-2881ea864028 --seat 0 --kyoku 0
+  python -m MewJ.cli <uuid> --seat 0 --structure-only
 """
 
 from __future__ import annotations
@@ -26,13 +27,13 @@ def main(argv: list[str] | None = None) -> int:
     load_dotenv(MEWJ_ROOT / ".env", MEWJ_ROOT.parent / "tensoul" / ".env")
 
     parser = argparse.ArgumentParser(
-        description="MewJ Classic paipu review (JSON file or Majsoul link)"
+        description="MewJ Classic paipu review (local UUID under paipu/ or Majsoul link)"
     )
     parser.add_argument(
         "paipu",
         nargs="?",
         default=None,
-        help="tenhou.net/6 JSON file path (optional if --link is set)",
+        help="paipu UUID (loads MewJ/paipu/<uuid>.json; optional if --link is set)",
     )
     parser.add_argument(
         "--link",
@@ -40,7 +41,13 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Majsoul paipu share URL or UUID (downloads via tensoul, cached in MewJ/paipu/)",
     )
-    parser.add_argument("--seat", type=int, default=0, choices=range(4), help="player seat 0-3")
+    parser.add_argument(
+        "--seat",
+        type=int,
+        default=None,
+        choices=range(4),
+        help="player seat 0-3 (default: auto from Majsoul URL _a… / cached _target_actor)",
+    )
     parser.add_argument(
         "--kyoku",
         type=int,
@@ -80,11 +87,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.link and args.paipu:
-        print("请只指定 --link 或 JSON 路径之一", file=sys.stderr)
+        print("请只指定 --link 或牌谱 uuid 之一", file=sys.stderr)
         return 2
     if not args.link and not args.paipu:
         parser.print_help()
-        print("\n需要提供 JSON 路径或 --link", file=sys.stderr)
+        print("\n需要提供牌谱 uuid（paipu/ 目录）或 --link", file=sys.stderr)
         return 2
 
     source = args.link if args.link else str(args.paipu)
@@ -98,6 +105,7 @@ def main(argv: list[str] | None = None) -> int:
             nanikiru_url=args.url,
             structure_only=args.structure_only,
             force_download=args.force_download,
+            local_uuid=not bool(args.link),
             output=args.output,
         )
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
