@@ -6,15 +6,27 @@ import atexit
 import os
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
 
 import requests
 
 from .converter import build_request, id_to_tile_name, tile_name_to_id  # noqa: E402
 from .defense import compute_defense, deal_in_for_tile  # noqa: E402
+from .nanikiru_pool import (  # noqa: E402
+    DEFAULT_NANIKIRU,
+    NanikiruPool,
+    default_nanikiru_exe,
+    nanikiru_port,
+    nanikiru_reachable,
+    pick_url,
+    resolve_workers,
+    restart_worker,
+    set_active_pool,
+)
 from .params import PARAMS as _P  # noqa: E402
 from .posture import Posture, advance, apply_posture, evaluate_posture  # noqa: E402
 from .replay import CallOpportunity, DecisionPoint, extract_kyoku_views  # noqa: E402
@@ -32,32 +44,9 @@ from .scoring import (  # noqa: E402
 
 _MEWJ_ROOT = Path(__file__).resolve().parent
 
-DEFAULT_NANIKIRU = "http://127.0.0.1:50000"
 MAHJONG_CPP_VERSION = "0.9.8"
 
-
-def _default_nanikiru_exe() -> Path:
-    """定位 nanikiru.exe：环境变量 > MewJ/engine/ > 仓库级 mahjong-cpp 构建目录。"""
-    env = os.environ.get("MEWJ_NANIKIRU_EXE")
-    candidates = []
-    if env:
-        candidates.append(Path(env))
-    candidates.append(_MEWJ_ROOT / "engine" / "nanikiru.exe")
-    candidates.append(
-        _MEWJ_ROOT.parent
-        / "mahjong-cpp"
-        / "build"
-        / "src"
-        / "server"
-        / "nanikiru.exe"
-    )
-    for path in candidates:
-        if path.is_file():
-            return path
-    return candidates[0] if env else candidates[1]
-
-
-DEFAULT_NANIKIRU_EXE = _default_nanikiru_exe()
+DEFAULT_NANIKIRU_EXE = default_nanikiru_exe()
 
 # Preferred flag order for client requests. Server also forces shanten_down=off
 # when shanten >= 3; this fallback covers stack-overflow on awkward 0-2 shanten hands.
@@ -536,25 +525,7 @@ def _rescore_policy_pool(cands: List[dict]) -> None:
         c["recommendation_weight"] = w
 
 
-def _nanikiru_reachable(nanikiru_url: str, timeout: float = 2.0) -> bool:
-    try:
-        # GET is rejected with 400 by nanikiru; any HTTP response means alive.
-        requests.get(nanikiru_url, timeout=timeout)
-        return True
-    except requests.exceptions.HTTPError:
-        return True
-    except requests.exceptions.RequestException:
-        return False
-
-
-def _nanikiru_port(nanikiru_url: str) -> int:
-    parsed = urlparse(nanikiru_url)
-    if parsed.port:
-        return int(parsed.port)
-    return 50000
-
-
-# 由本进程启动的 nanikiru 句柄；退出时负责关闭（只关自己启动的实例）
+# 单实例回退：无活跃池时仍可启动/重启一个 nanikiru（兼容旧调用）
 _NANIKIRU_PROC: Optional[subprocess.Popen] = None
 _NANIKIRU_LOG_HANDLE = None
 _ATEXIT_REGISTERED = False
@@ -601,19 +572,28 @@ def _nanikiru_child_env(exe_path: Path) -> dict:
     return env
 
 
-def restart_nanikiru(
+def _legacy_restart_nanikiru(
     nanikiru_url: str = DEFAULT_NANIKIRU,
     exe: Optional[Path] = None,
 ) -> bool:
-    """Kill existing nanikiru and start a fresh process. Returns True if reachable."""
+    """Single-instance restart (PID of owned proc, else taskkill /IM)."""
     global _NANIKIRU_PROC, _NANIKIRU_LOG_HANDLE, _ATEXIT_REGISTERED
     path = Path(exe) if exe else DEFAULT_NANIKIRU_EXE
-    port = _nanikiru_port(nanikiru_url)
+    port = nanikiru_port(nanikiru_url)
     if not path.is_file():
         print(f"  [warn] nanikiru.exe not found: {path}", flush=True)
         return False
 
-    if sys.platform == "win32":
+    if _NANIKIRU_PROC is not None and _NANIKIRU_PROC.poll() is None:
+        try:
+            _NANIKIRU_PROC.terminate()
+            _NANIKIRU_PROC.wait(timeout=3)
+        except Exception:
+            try:
+                _NANIKIRU_PROC.kill()
+            except Exception:
+                pass
+    elif sys.platform == "win32":
         subprocess.run(
             ["taskkill", "/IM", "nanikiru.exe", "/F"],
             capture_output=True,
@@ -648,9 +628,20 @@ def restart_nanikiru(
         _ATEXIT_REGISTERED = True
     for _ in range(40):
         time.sleep(0.15)
-        if _nanikiru_reachable(nanikiru_url):
+        if nanikiru_reachable(nanikiru_url):
             return True
     return False
+
+
+def restart_nanikiru(
+    nanikiru_url: str = DEFAULT_NANIKIRU,
+    exe: Optional[Path] = None,
+) -> bool:
+    """Restart the worker for ``nanikiru_url`` (pool-aware when active)."""
+    return restart_worker(
+        nanikiru_url,
+        legacy_restart=lambda u: _legacy_restart_nanikiru(u, exe=exe),
+    )
 
 
 def _parse_response(
@@ -967,13 +958,15 @@ def analyze_decision_resilient(
 
     Some hands stack-overflow or hang when tegawari / shanten_down are on.
     Keep 手替 whenever possible (disable 向听回退 first); last resort turns both off.
+    Pins one pool worker for the whole retry chain so restart only hits that instance.
     """
+    url = pick_url(nanikiru_url)
     last_exc: Optional[BaseException] = None
     for i, (teg, sd) in enumerate(_FLAG_ATTEMPTS):
         try:
             return analyze_decision(
                 dp,
-                nanikiru_url=nanikiru_url,
+                nanikiru_url=url,
                 timeout=timeout,
                 enable_tegawari=teg,
                 enable_shanten_down=sd,
@@ -987,7 +980,7 @@ def analyze_decision_resilient(
             )
             if i + 1 >= len(_FLAG_ATTEMPTS):
                 break
-            if not restart_nanikiru(nanikiru_url):
+            if not restart_nanikiru(url):
                 raise RuntimeError(
                     "nanikiru 崩溃后无法重启。请检查 nanikiru.exe 路径"
                     "（环境变量 MEWJ_NANIKIRU_EXE 或 MewJ/engine/nanikiru.exe）"
@@ -1006,8 +999,15 @@ def review_paipu(
     max_turns: Optional[int] = None,
     nanikiru_url: str = DEFAULT_NANIKIRU,
     skip_analyze: bool = False,
+    workers: Optional[int] = None,
 ) -> dict:
-    """Build Classic-style review payload for one seat."""
+    """Build Classic-style review payload for one seat.
+
+    When analyzing, starts a nanikiru worker pool (``workers`` / MEWJ_WORKERS /
+    params.runtime.workers). Discard points in each kyoku are analyzed in
+    parallel; posture is still applied in chronological order. Call points
+    keep sequential posture context but fan out their internal engine queries.
+    """
     from . import call_eval  # 延迟 import：call_eval 依赖本模块，避免循环
 
     views = extract_kyoku_views(paipu, seat, include_calls=True)
@@ -1018,26 +1018,116 @@ def review_paipu(
     total = sum(len(v.decisions) for v in views)
     if max_turns is not None:
         total = min(total, max_turns)
-    if not skip_analyze:
-        if not _nanikiru_reachable(nanikiru_url):
-            print("nanikiru 未就绪，尝试启动…", flush=True)
-            if not restart_nanikiru(nanikiru_url):
-                raise RuntimeError(
-                    f"nanikiru 未运行或无法连接: {nanikiru_url}\n"
-                    "请手动启动 nanikiru，或设置 MEWJ_NANIKIRU_EXE / "
-                    "将 nanikiru.exe 放到 MewJ/engine/ 后重试，或重新运行 review.bat。"
-                )
-        print(f"共 {total} 个决策点，开始调用 nanikiru（默认手替开）…", flush=True)
 
+    n_workers = resolve_workers(workers)
+    pool: Optional[NanikiruPool] = None
+    if not skip_analyze:
+        pool = NanikiruPool(base_url=nanikiru_url, workers=n_workers)
+        try:
+            pool.start()
+        except RuntimeError:
+            # Fall back to single-instance legacy start on base URL
+            if not nanikiru_reachable(nanikiru_url):
+                print("nanikiru 未就绪，尝试启动…", flush=True)
+                if not _legacy_restart_nanikiru(nanikiru_url):
+                    raise
+            pool = NanikiruPool(base_url=nanikiru_url, workers=1)
+            pool.start()
+        set_active_pool(pool)
+        print(
+            f"共 {total} 个决策点，开始调用 nanikiru"
+            f"（workers={len(pool.urls())}，默认手替开）…",
+            flush=True,
+        )
+
+    try:
+        return _review_paipu_body(
+            views,
+            paipu,
+            seat,
+            max_turns=max_turns,
+            total=total,
+            nanikiru_url=nanikiru_url,
+            skip_analyze=skip_analyze,
+            n_workers=n_workers,
+            call_eval=call_eval,
+        )
+    finally:
+        set_active_pool(None)
+        if pool is not None:
+            # Keep adopted (pre-existing) listeners; only shut down owned children.
+            pool.shutdown()
+
+
+def _review_paipu_body(
+    views,
+    paipu: dict,
+    seat: int,
+    *,
+    max_turns: Optional[int],
+    total: int,
+    nanikiru_url: str,
+    skip_analyze: bool,
+    n_workers: int,
+    call_eval: Any,
+) -> dict:
     report_kyokus = []
     analyzed = 0
+    progress_lock = threading.Lock()
+
+    def bump(label: str) -> int:
+        nonlocal analyzed
+        with progress_lock:
+            analyzed += 1
+            n = analyzed
+        print(f"  [{n}/{total}] {label} …", flush=True)
+        return n
+
     for view in views:
+        # Plan which decisions will be analyzed (max_turns is chronological).
+        planned: List[Tuple[Any, bool]] = []
+        for dp in view.decisions:
+            if max_turns is not None and analyzed + sum(
+                1 for _, a in planned if a
+            ) >= max_turns:
+                planned.append((dp, False))
+            elif skip_analyze:
+                planned.append((dp, False))
+            else:
+                planned.append((dp, True))
+
+        # Prefetch discard analyses in parallel (posture applied later in order).
+        discard_jobs: Dict[int, Any] = {}
+        if not skip_analyze and n_workers >= 1:
+            discards_to_run = [
+                (i, dp)
+                for i, (dp, do) in enumerate(planned)
+                if do and not isinstance(dp, CallOpportunity)
+            ]
+            if discards_to_run:
+                with ThreadPoolExecutor(
+                    max_workers=max(1, min(n_workers, len(discards_to_run)))
+                ) as ex:
+                    fut_map = {
+                        ex.submit(
+                            analyze_decision_resilient, dp, nanikiru_url=nanikiru_url
+                        ): i
+                        for i, dp in discards_to_run
+                    }
+                    for fut in as_completed(fut_map):
+                        i = fut_map[fut]
+                        dp = planned[i][0]
+                        bump(dp.label)
+                        try:
+                            discard_jobs[i] = fut.result()
+                        except Exception as exc:
+                            discard_jobs[i] = {"ok": False, "error": str(exc)}
+
         decisions_out = []
         # 攻防姿态：每局从全牌效开始，局内只能 全牌效→兜牌→全弃 单调前进
         posture = Posture.FULL_EFFICIENCY
-        for dp in view.decisions:
+        for i, (dp, do_analyze) in enumerate(planned):
             if isinstance(dp, CallOpportunity):
-                # 副露决策点：碰/吃 vs 跳过的反事实评估（不动 posture）
                 entry = {
                     "kind": "call",
                     "label": dp.label,
@@ -1057,15 +1147,11 @@ def review_paipu(
                     "analysis": None,
                     "skipped": False,
                 }
-                if max_turns is not None and analyzed >= max_turns:
+                if not do_analyze:
                     entry["skipped"] = True
-                elif not skip_analyze:
-                    analyzed += 1
-                    print(f"  [{analyzed}/{total}] {dp.label} …", flush=True)
+                else:
+                    bump(dp.label)
                     try:
-                        # 形听轴语境：当前姿态 + 威胁/危险查询能力（CallOpportunity
-                        # 与 DecisionPoint 防守字段同名，compute_defense 鸭子类型适用；
-                        # 无防守数据时 risk_lookup=None，形听轴自动禁用）
                         call_threats = None
                         call_risk_lookup = None
                         call_defense = None
@@ -1089,6 +1175,7 @@ def review_paipu(
                             posture=posture,
                             threats=call_threats,
                             defense=call_defense,
+                            workers=n_workers,
                         )
                         decision = call_eval.decide(ev, risk_lookup=call_risk_lookup)
                         match = (
@@ -1113,7 +1200,7 @@ def review_paipu(
                 decisions_out.append(entry)
                 continue
 
-            if max_turns is not None and analyzed >= max_turns:
+            if not do_analyze:
                 decisions_out.append(
                     {
                         "kind": "discard",
@@ -1147,19 +1234,18 @@ def review_paipu(
                 "analysis": None,
                 "skipped": False,
             }
-            if not skip_analyze:
-                analyzed += 1
-                print(f"  [{analyzed}/{total}] {dp.label} …", flush=True)
-                try:
-                    entry["analysis"] = analyze_decision_resilient(
-                        dp, nanikiru_url=nanikiru_url
-                    )
-                    ana = entry["analysis"]
-                    if ana.get("ok"):
-                        posture = advance(posture, evaluate_posture(ana))
-                        posture = apply_posture(ana, posture)
-                except Exception as exc:
-                    entry["analysis"] = {"ok": False, "error": str(exc)}
+            try:
+                if i in discard_jobs:
+                    ana = discard_jobs[i]
+                else:
+                    bump(dp.label)
+                    ana = analyze_decision_resilient(dp, nanikiru_url=nanikiru_url)
+                entry["analysis"] = ana
+                if ana.get("ok"):
+                    posture = advance(posture, evaluate_posture(ana))
+                    posture = apply_posture(ana, posture)
+            except Exception as exc:
+                entry["analysis"] = {"ok": False, "error": str(exc)}
             decisions_out.append(entry)
 
         report_kyokus.append(

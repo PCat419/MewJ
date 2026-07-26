@@ -72,6 +72,12 @@ def main(argv: list[str] | None = None) -> int:
         help="nanikiru URL",
     )
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="nanikiru worker processes (default: MEWJ_WORKERS or params.runtime.workers=4)",
+    )
+    parser.add_argument(
         "-o",
         "--output",
         type=Path,
@@ -107,6 +113,7 @@ def main(argv: list[str] | None = None) -> int:
             force_download=args.force_download,
             local_uuid=not bool(args.link),
             output=args.output,
+            workers=args.workers,
         )
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         print(f"错误: {exc}", file=sys.stderr)

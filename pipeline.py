@@ -334,12 +334,14 @@ def run_pipeline(
     force_download: bool = False,
     local_uuid: bool = False,
     output: Optional[Path] = None,
+    workers: Optional[int] = None,
 ) -> Path:
     """
     Full pipeline: source (link or local uuid) → review → HTML report.
     Returns the written HTML path.
 
     If ``seat`` is omitted, try Majsoul URL ``_a…`` / cached ``_target_actor``.
+    ``workers`` controls how many local nanikiru processes to use.
     """
     # Prefer MewJ/.env; fall back to tensoul/.env if present
     load_dotenv(MEWJ_ROOT / ".env", MEWJ_ROOT.parent / "tensoul" / ".env")
@@ -380,6 +382,7 @@ def run_pipeline(
         max_turns=max_turns,
         nanikiru_url=nanikiru_url,
         skip_analyze=structure_only,
+        workers=workers,
     )
 
     out = output

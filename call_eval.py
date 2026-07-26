@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import math
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -45,6 +46,7 @@ from .converter import (
     parse_melds,
     tile_name_to_id,
 )
+from .nanikiru_pool import pick_url, resolve_workers
 from .noten import is_pusher, opponent_tenpai_probs, payoff_table, ryukyoku_prob
 from .params import PARAMS as _P
 from .posture import Posture
@@ -535,18 +537,19 @@ def _query_best(
         _furiten_wall_zero(wall, self_discards)
     last_exc: Optional[BaseException] = None
     n_flags = len(_FLAG_ATTEMPTS)
+    url = pick_url(nanikiru_url)
     for i, (teg, sd) in enumerate(_FLAG_ATTEMPTS):
         req["enable_tegawari"] = teg
         req["enable_shanten_down"] = sd
         try:
-            resp = requests.post(nanikiru_url, json=req, timeout=timeout)
+            resp = requests.post(url, json=req, timeout=timeout)
             raw = resp.json()
         except _NANIKIRU_TRANSPORT_ERRORS as exc:
             last_exc = exc
             kind = "超时" if isinstance(exc, requests.exceptions.Timeout) else "断开"
             print(f"    nanikiru {kind}（手替={teg} 向听回退={sd}），重启…", flush=True)
             if i + 1 < n_flags:
-                restart_nanikiru(nanikiru_url)
+                restart_nanikiru(url)
             continue
         except Exception as exc:
             last_exc = exc
@@ -586,6 +589,7 @@ def evaluate_opportunity(
     posture: Optional[Any] = None,
     threats: Optional[List[Dict[str, Any]]] = None,
     defense: Optional[Dict[str, Any]] = None,
+    workers: Optional[int] = None,
 ) -> Dict[str, Any]:
     """对一个副露机会点求 EV(跳过) 与 EV(各碰/吃变体)。
 
@@ -593,6 +597,8 @@ def evaluate_opportunity(
     ``posture`` / ``threats`` 为形听轴语境；``defense`` 为完整防守结果
     （review 传入）。危险查询 callable 不可序列化，故 risk_lookup 不经本
     函数而直接传给 decide。
+
+    摸牌假设与副露变体的引擎查询可按 ``workers`` 并行（依赖活跃 nanikiru 池）。
     """
     turn = opp.turn  # 副露后切牌 / 下次摸牌均按「自家即将进行的巡」取值
     dora = opp.dora_indicators
@@ -600,6 +606,7 @@ def evaluate_opportunity(
     # threats 可单独传入；有完整 defense 时以其 threats 为准
     if defense is not None and threats is None:
         threats = defense.get("threats") or []
+    n_workers = resolve_workers(workers)
 
     # ---- 跳过侧：本地 wall 算摸牌分布，逐假设查引擎加权 ----
     seen0, om0, _ = _build_seen_other(opp)
@@ -688,21 +695,56 @@ def evaluate_opportunity(
             defense=defense,
         )
 
+    # 并行查询：相关摸牌 + 无关牌代表
+    draw_jobs: List[Tuple[str, int, bool]] = [
+        (tname, cnt, False) for tname, cnt in relevant
+    ]
+    if irrelevant:
+        draw_jobs.append(
+            (irrelevant[0][0], sum(c for _, c in irrelevant), True)
+        )
+
+    draw_results: Dict[int, dict] = {}
+    if draw_jobs:
+        with ThreadPoolExecutor(
+            max_workers=max(1, min(n_workers, len(draw_jobs)))
+        ) as ex:
+            fut_map = {
+                ex.submit(query_draw, tname): idx
+                for idx, (tname, _cnt, _lump) in enumerate(draw_jobs)
+            }
+            for fut in as_completed(fut_map):
+                draw_results[fut_map[fut]] = fut.result()
+
     skip_detail: List[dict] = []
     ev_skip = 0.0
     wp_skip = 0.0
-    for tname, cnt in relevant:
-        r = query_draw(tname)
+    for idx, (tname, cnt, is_lump) in enumerate(draw_jobs):
+        r = draw_results.get(idx) or {}
+        label = (
+            f"无关牌x{len(irrelevant)}(代表{tname})"
+            if is_lump
+            else tname
+        )
         if r.get("ev") is None:
-            errors.append(f"摸{tname}: {r.get('error')}")
-            skip_detail.append({"tile": tname, "cnt": cnt, "error": r.get("error")})
+            err_label = f"无关牌代表{tname}" if is_lump else f"摸{tname}"
+            errors.append(f"{err_label}: {r.get('error')}")
+            skip_detail.append(
+                {
+                    "tile": (
+                        f"无关牌x{len(irrelevant)}" if is_lump else tname
+                    ),
+                    "cnt": cnt,
+                    "error": r.get("error"),
+                }
+            )
             continue
         p = cnt / total_w
         ev_skip += p * r["ev"]
         wp_skip += p * (r["win"] or 0.0)
         skip_detail.append(
             {
-                "tile": tname,
+                "tile": label,
                 "cnt": cnt,
                 "p": round(p, 4),
                 "ev": round(r["ev"], 1),
@@ -713,32 +755,6 @@ def evaluate_opportunity(
                 "top3": r.get("top3"),
             }
         )
-    if irrelevant:
-        rep = irrelevant[0][0]
-        lump_cnt = sum(c for _, c in irrelevant)
-        r = query_draw(rep)
-        if r.get("ev") is not None:
-            p = lump_cnt / total_w
-            ev_skip += p * r["ev"]
-            wp_skip += p * (r["win"] or 0.0)
-            skip_detail.append(
-                {
-                    "tile": f"无关牌x{len(irrelevant)}(代表{rep})",
-                    "cnt": lump_cnt,
-                    "p": round(p, 4),
-                    "ev": round(r["ev"], 1),
-                    "win": r["win"],
-                    "cut": r["best_tile"],
-                    "shanten": r.get("shanten"),
-                    "cut_shanten": r.get("cut_shanten"),
-                    "top3": r.get("top3"),
-                }
-            )
-        else:
-            errors.append(f"无关牌代表{rep}: {r.get('error')}")
-            skip_detail.append(
-                {"tile": f"无关牌x{len(irrelevant)}", "cnt": lump_cnt, "error": r.get("error")}
-            )
 
     # 相关牌种全部失败 → 跳过侧期望无法计算，整点失败
     if not any(d.get("ev") is not None for d in skip_detail):
@@ -754,7 +770,7 @@ def evaluate_opportunity(
     skip_shanten = max(_shs) if _shs else None
 
     # ---- 副露侧：每个合法碰/吃变体（消耗 2 张成面子，余 11 张查引擎） ----
-    variants: List[dict] = []
+    variant_specs: List[dict] = []
     for action in ("pon", "chii"):
         for consume in (opp.legal or {}).get(action) or []:
             consume_names = [tenhou_to_mpsz(t) for t in consume]
@@ -781,58 +797,90 @@ def evaluate_opportunity(
                 "sourceSeat": opp.discarder,
             }
             seen1, om1, self_melds1 = _build_seen_other(opp, extra_self_meld=new_meld)
-            r = _query_best(
-                new_hand,
-                self_melds1,
-                om1,
-                seen1,
-                opp.self_discards,
-                dora,
-                opp.round_wind,
-                opp.seat_wind,
-                turn,
-                nanikiru_url,
-                timeout,
-                opp=opp,
-                defense=defense,
-            )
-            if r.get("ev") is None:
-                errors.append(f"{action}{consume_names}: {r.get('error')}")
-                continue
-            # 候选级向听：切完最优切之后的向听。优先引擎 per-candidate 值，
-            # 缺失（旧缓存条目）时本地计算「副露后手牌 − 所切牌」的向听
-            cut_sh = r.get("cut_shanten")
-            if cut_sh is None and r.get("best_tile"):
-                try:
-                    after_cut: Optional[List[str]] = list(new_hand)
-                    bt = r["best_tile"]
-                    if bt in after_cut:
-                        after_cut.remove(bt)
-                    else:
-                        alt = {"0m": "5m", "0p": "5p", "0s": "5s"}.get(bt)
-                        if alt and alt in after_cut:
-                            after_cut.remove(alt)
-                        else:
-                            after_cut = None
-                    if after_cut is not None:
-                        cut_sh = local_shanten(after_cut, len(self_melds1))
-                except Exception:
-                    cut_sh = None
-            variants.append(
+            variant_specs.append(
                 {
                     "action": action,
-                    "consume": consume_names,
-                    "ev": r["ev"],
-                    "win": r["win"],
-                    "cut": r["best_tile"],
-                    "shanten": r.get("shanten"),
-                    "cut_shanten": cut_sh,
-                    "cut_top3": r.get("top3"),
-                    "delta_ev": r["ev"] - ev_skip,
-                    "delta_win": (r["win"] or 0.0) - wp_skip,
-                    "rejected": None,
+                    "consume_names": consume_names,
+                    "new_hand": new_hand,
+                    "self_melds1": self_melds1,
+                    "seen1": seen1,
+                    "om1": om1,
                 }
             )
+
+    def query_variant(spec: dict) -> dict:
+        return _query_best(
+            spec["new_hand"],
+            spec["self_melds1"],
+            spec["om1"],
+            spec["seen1"],
+            opp.self_discards,
+            dora,
+            opp.round_wind,
+            opp.seat_wind,
+            turn,
+            nanikiru_url,
+            timeout,
+            opp=opp,
+            defense=defense,
+        )
+
+    variant_results: Dict[int, dict] = {}
+    if variant_specs:
+        with ThreadPoolExecutor(
+            max_workers=max(1, min(n_workers, len(variant_specs)))
+        ) as ex:
+            fut_map = {
+                ex.submit(query_variant, spec): idx
+                for idx, spec in enumerate(variant_specs)
+            }
+            for fut in as_completed(fut_map):
+                variant_results[fut_map[fut]] = fut.result()
+
+    variants: List[dict] = []
+    for idx, spec in enumerate(variant_specs):
+        action = spec["action"]
+        consume_names = spec["consume_names"]
+        new_hand = spec["new_hand"]
+        self_melds1 = spec["self_melds1"]
+        r = variant_results.get(idx) or {}
+        if r.get("ev") is None:
+            errors.append(f"{action}{consume_names}: {r.get('error')}")
+            continue
+        # 候选级向听：切完最优切之后的向听。优先引擎 per-candidate 值，
+        # 缺失（旧缓存条目）时本地计算「副露后手牌 − 所切牌」的向听
+        cut_sh = r.get("cut_shanten")
+        if cut_sh is None and r.get("best_tile"):
+            try:
+                after_cut: Optional[List[str]] = list(new_hand)
+                bt = r["best_tile"]
+                if bt in after_cut:
+                    after_cut.remove(bt)
+                else:
+                    alt = {"0m": "5m", "0p": "5p", "0s": "5s"}.get(bt)
+                    if alt and alt in after_cut:
+                        after_cut.remove(alt)
+                    else:
+                        after_cut = None
+                if after_cut is not None:
+                    cut_sh = local_shanten(after_cut, len(self_melds1))
+            except Exception:
+                cut_sh = None
+        variants.append(
+            {
+                "action": action,
+                "consume": consume_names,
+                "ev": r["ev"],
+                "win": r["win"],
+                "cut": r["best_tile"],
+                "shanten": r.get("shanten"),
+                "cut_shanten": cut_sh,
+                "cut_top3": r.get("top3"),
+                "delta_ev": r["ev"] - ev_skip,
+                "delta_win": (r["win"] or 0.0) - wp_skip,
+                "rejected": None,
+            }
+        )
 
     return {
         "ok": True,
