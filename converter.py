@@ -81,17 +81,36 @@ def _parse_meld_type(mtype):
     raise ValueError("无法识别的副露类型: %s" % mtype)
 
 
+# 红五按普通 5 的序位排序（吃张必须升序，否则 nanikiru 役种/EV 会错）
+_AKA_SORT_AS = {34: 4, 35: 13, 36: 22}
+
+
+def meld_tile_sort_key(tile) -> int:
+    """副露牌排序键：红五视作对应普通 5，其余用 mahjong-cpp tile ID。"""
+    tid = tile_name_to_id(tile) if not isinstance(tile, int) else tile
+    return _AKA_SORT_AS.get(tid, tid)
+
+
 def parse_melds(melds):
-    """把 [{'type': 'pon', 'tiles': ['2m','2m','2m']}, ...] 转成 mahjong-cpp 格式。"""
+    """把 [{'type': 'pon', 'tiles': ['2m','2m','2m']}, ...] 转成 mahjong-cpp 格式。
+
+    吃（type=1）的 tiles 按序位升序排列。天凤 token / 牌谱里常见
+    ``[被鸣牌, a, b]``（如 7m,6m,8m），乱序传入会让引擎认不出顺子，
+    进而算错三色等役、EV 倒置。
+    """
     if not melds:
         return []
     result = []
     for i, m in enumerate(melds):
         if not isinstance(m, dict) or "type" not in m or "tiles" not in m:
             raise ValueError("第 %d 个副露必须是包含 type 和 tiles 的对象" % (i + 1))
+        mtype = _parse_meld_type(m["type"])
+        tiles = [tile_name_to_id(t) for t in m["tiles"]]
+        if mtype == 1:  # chii：必须升序
+            tiles = sorted(tiles, key=meld_tile_sort_key)
         result.append({
-            "type": _parse_meld_type(m["type"]),
-            "tiles": [tile_name_to_id(t) for t in m["tiles"]],
+            "type": mtype,
+            "tiles": tiles,
         })
     return result
 

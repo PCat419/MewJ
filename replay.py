@@ -7,6 +7,8 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Iterator, List, Optional, Union, Tuple
 
+from .converter import meld_tile_sort_key
+
 # Tenhou JSON tile int → mpsz
 def tenhou_to_mpsz(tile: int) -> str:
     if tile == 51:
@@ -301,9 +303,13 @@ def _meld_to_api(parsed: ParsedMeld, source_seat: Optional[str] = None) -> dict:
         "ankan": "ankan",
         "kakan": "kakan",
     }
+    tiles = list(parsed.tiles)
+    # 吃张按序位升序（与 converter.parse_melds / nanikiru 一致）；乱序会算错役
+    if parsed.type == "chii":
+        tiles = sorted(tiles, key=meld_tile_sort_key)
     return {
         "type": type_map[parsed.type],
-        "tiles": mpsz_list(parsed.tiles),
+        "tiles": mpsz_list(tiles),
         "calledTile": tenhou_to_mpsz(parsed.called) if parsed.called is not None else None,
         "sourceSeat": source_seat,
     }

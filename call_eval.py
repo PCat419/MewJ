@@ -42,6 +42,7 @@ from .converter import (
     build_request,
     build_wall,
     id_to_tile_name,
+    meld_tile_sort_key,
     parse_hand,
     parse_melds,
     tile_name_to_id,
@@ -789,7 +790,9 @@ def evaluate_opportunity(
                         break
             if not ok:
                 continue
-            meld_tiles = sorted(consume_names + [opp.disc_tile])
+            meld_tiles = sorted(
+                consume_names + [opp.disc_tile], key=meld_tile_sort_key
+            )
             new_meld = {
                 "type": action,
                 "tiles": meld_tiles,
