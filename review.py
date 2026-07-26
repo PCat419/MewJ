@@ -365,7 +365,7 @@ def apply_tenpai_keep_penalty(
     tenpai = [
         c
         for c in candidates
-        if _cand_shanten(c) == 0 and not c.get("furiten")
+        if _cand_shanten(c) == 0 and not c.get("furiten") and not c.get("kuikae")
     ]
     if not tenpai:
         for c in candidates:
@@ -433,12 +433,15 @@ def pick_recommended(
     """
     if not candidates:
         return None
+    active = [c for c in candidates if not c.get("kuikae")]
+    if not active:
+        return None
     if not use_ev:
-        return candidates[0].get("tile")
+        return active[0].get("tile")
 
-    desire = _resolve_offensive_desire(candidates, offensive_desire)
-    min_s = min(_cand_shanten(c) for c in candidates)
-    advance_pool = [c for c in candidates if _cand_shanten(c) == min_s]
+    desire = _resolve_offensive_desire(active, offensive_desire)
+    min_s = min(_cand_shanten(c) for c in active)
+    advance_pool = [c for c in active if _cand_shanten(c) == min_s]
     advance_pool.sort(
         key=lambda c: (
             1 if c.get("furiten") else 0,
@@ -452,7 +455,7 @@ def pick_recommended(
     a = advance_pool[0]
 
     allowed = [c for c in advance_pool if not c.get("furiten")] or list(advance_pool)
-    for c in candidates:
+    for c in active:
         if _cand_shanten(c) <= min_s:
             continue
         if _allows_retreat(a, c, turn, offensive_desire=desire):
@@ -490,12 +493,16 @@ def _policy_valid_candidates(
 
     与 pick_recommended 同一套门控：拆听须过保听线 / 交换率，其余退向须过
     巡目/深度阈值。供 _attach_defense 在集合内按调整后效用选最优。
+    食替禁切不参与最低向听与合格池。
     """
     if not candidates:
         return []
-    desire = _resolve_offensive_desire(candidates, offensive_desire)
-    min_s = min(_cand_shanten(c) for c in candidates)
-    advance_pool = [c for c in candidates if _cand_shanten(c) == min_s]
+    active = [c for c in candidates if not c.get("kuikae")]
+    if not active:
+        return []
+    desire = _resolve_offensive_desire(active, offensive_desire)
+    min_s = min(_cand_shanten(c) for c in active)
+    advance_pool = [c for c in active if _cand_shanten(c) == min_s]
     advance_pool.sort(
         key=lambda c: (
             1 if c.get("furiten") else 0,
@@ -508,7 +515,7 @@ def _policy_valid_candidates(
     )
     a = advance_pool[0]
     valid = [c for c in advance_pool if not c.get("furiten")] or list(advance_pool)
-    for c in candidates:
+    for c in active:
         if _cand_shanten(c) <= min_s:
             continue
         if _allows_retreat(a, c, turn, offensive_desire=desire):
@@ -588,10 +595,15 @@ def _retreat_exchange_net(advance: dict, candidate: dict) -> float:
 def _rescore_policy_pool(cands: List[dict]) -> None:
     """按（已含保听软惩罚的）综合效用对合格候选 softmax；不合格权重≈0。
 
+    食替禁切权重恒为 0（不参与 floor 残差）。
     不改写 ``adjusted_utility``（保持客观扣罚后的值）。
     """
-    eligible = [c for c in cands if not c.get("policy_rejected")]
-    rejected = [c for c in cands if c.get("policy_rejected")]
+    eligible = [c for c in cands if not c.get("policy_rejected") and not c.get("kuikae")]
+    rejected = [c for c in cands if c.get("policy_rejected") and not c.get("kuikae")]
+    kuikae = [c for c in cands if c.get("kuikae")]
+    for c in kuikae:
+        c["recommendation_weight"] = 0.0
+        c["policy_rejected"] = True
     if not eligible:
         return
     elig_weights = softmax_weights(
@@ -925,6 +937,13 @@ def _attach_defense(dp: DecisionPoint, analysis: Dict[str, Any]) -> Dict[str, An
 
     cands = analysis.get("candidates") or []
     if analysis.get("ok") and cands:
+        # 鸣牌后切牌：食替禁切（現物/筋）先打标，避免无役形听等非法切抢最低向听
+        if getattr(dp, "drawn_tile", None) is None and (dp.melds or []):
+            last_meld = dp.melds[-1]
+            if str(last_meld.get("type") or "") in ("chii", "pon"):
+                from .call_eval import apply_kuikae_marks
+
+                apply_kuikae_marks(cands, last_meld)
         desire_info = offensive_desire_from_dp(dp)
         score_candidates(
             cands,
@@ -952,17 +971,23 @@ def _attach_defense(dp: DecisionPoint, analysis: Dict[str, Any]) -> Dict[str, An
         )
         valid_ids = {id(c) for c in valid}
         for c in cands:
-            c["policy_rejected"] = id(c) not in valid_ids
-        picked = max(
-            valid,
-            key=lambda c: (
-                _cand_utility(c),
-                _cand_winp(c),
-                _cand_tenpai(c),
-                _cand_ev(c),
-            ),
-        )
-        best = picked.get("tile") if picked else None
+            if c.get("kuikae"):
+                c["policy_rejected"] = True
+            else:
+                c["policy_rejected"] = id(c) not in valid_ids
+        if valid:
+            picked = max(
+                valid,
+                key=lambda c: (
+                    _cand_utility(c),
+                    _cand_winp(c),
+                    _cand_tenpai(c),
+                    _cand_ev(c),
+                ),
+            )
+            best = picked.get("tile") if picked else None
+        else:
+            best = None
         # 先按扣罚后的效用重算权重，再判定尚可/不一致（否则用的是扣罚前旧权重）
         _rescore_policy_pool(cands)
         classified = classify_discard_match(cands, dp.actual_discard, best)
@@ -971,7 +996,9 @@ def _attach_defense(dp: DecisionPoint, analysis: Dict[str, Any]) -> Dict[str, An
         analysis["match"] = classified["match"]
         analysis["match_kind"] = classified["match_kind"]
         ordered = order_candidates(cands)
-        ordered.sort(key=lambda c: 1 if c.get("policy_rejected") else 0)
+        ordered.sort(
+            key=lambda c: (1 if c.get("kuikae") else 0, 1 if c.get("policy_rejected") else 0)
+        )
         analysis["candidates"] = ordered
         analysis["recommendation_model"] = {
             "name": "risk-adjusted-softmax",

@@ -153,6 +153,63 @@ def _norm_kind(tile: str) -> str:
     return t
 
 
+def kuikae_forbidden_tiles(meld: Optional[dict]) -> set:
+    """鸣牌后立刻禁切的牌种（現物食替 + 吃的筋食替），归一化 mpsz。
+
+    规则（天凤/雀魂同）：
+    - 碰/吃：不可切与被鸣牌同种（赤五≡普通 5）；
+    - 吃：以升序顺子 [L,M,R] 计，鸣 R 禁 L−1，鸣 L 禁 R+1，鸣 M 两侧都禁。
+    """
+    if not meld:
+        return set()
+    mtype = str(meld.get("type") or "").lower()
+    if mtype not in ("chii", "chi", "pon", "碰", "吃"):
+        return set()
+    called = meld.get("calledTile")
+    if not called:
+        return set()
+    forbidden = {_norm_kind(str(called))}
+    if mtype in ("pon", "碰"):
+        return forbidden
+
+    ranks: List[int] = []
+    suit: Optional[str] = None
+    for raw in meld.get("tiles") or []:
+        t = _norm_kind(str(raw))
+        if len(t) < 2 or t[1] not in "mps" or not t[0].isdigit():
+            return forbidden
+        ranks.append(int(t[0]))
+        suit = t[1]
+    if suit is None or len(ranks) != 3:
+        return forbidden
+    ranks.sort()
+    lo, mid, hi = ranks[0], ranks[1], ranks[2]
+    if hi - lo != 2 or mid != lo + 1:
+        return forbidden
+    c = int(_norm_kind(str(called))[0])
+    if c == hi and lo > 1:
+        forbidden.add(f"{lo - 1}{suit}")
+    if c == lo and hi < 9:
+        forbidden.add(f"{hi + 1}{suit}")
+    if c == mid:
+        if lo > 1:
+            forbidden.add(f"{lo - 1}{suit}")
+        if hi < 9:
+            forbidden.add(f"{hi + 1}{suit}")
+    return forbidden
+
+
+def apply_kuikae_marks(cands: List[dict], meld: Optional[dict]) -> set:
+    """给候选打上 kuikae 标记；返回禁切牌种集合。"""
+    banned = kuikae_forbidden_tiles(meld)
+    if not banned:
+        return banned
+    for c in cands:
+        if _norm_kind(str(c.get("tile") or "")) in banned:
+            c["kuikae"] = True
+    return banned
+
+
 def _build_seen_other(
     opp: CallOpportunity, extra_self_meld: Optional[dict] = None
 ):
@@ -471,7 +528,9 @@ def policy_best_cut(
             },
         )
     valid = _policy_valid_candidates(cands, turn)
-    pool = valid or list(cands)
+    pool = [c for c in (valid or list(cands)) if not c.get("kuikae")]
+    if not pool:
+        pool = [c for c in cands if not c.get("kuikae")] or list(cands)
     return max(pool, key=lambda c: (_cand_utility(c), _cand_uke(c), _cand_ev(c)))
 
 
@@ -491,7 +550,8 @@ def _top3_cache(cands: List[dict], turn: int) -> List[dict]:
             "shanten": c.get("shanten"),
             "uke": c.get("uke"),
             "furiten": c.get("furiten"),
-            "policy_rejected": id(c) not in valid_ids,
+            "kuikae": bool(c.get("kuikae")),
+            "policy_rejected": id(c) not in valid_ids or bool(c.get("kuikae")),
         }
         for c in ranked[:3]
     ]
@@ -512,6 +572,7 @@ def _query_best(
     *,
     opp: Optional[CallOpportunity] = None,
     defense: Optional[Dict[str, Any]] = None,
+    kuikae_meld: Optional[dict] = None,
 ) -> dict:
     """一次引擎查询，按切牌卡综合口径取最优切，返回 {ev, win, best_tile,
     shanten, cut_shanten, top3}；失败 {"error": ...}。
@@ -519,6 +580,7 @@ def _query_best(
     连接断开/超时时重启引擎并按 (手替, 向听回退) 降级重试；
     success:false + err_msg 视为该次失败，不重试。
     ``defense`` 非空时选切计入危险度与罚符信用（与切牌卡一致）。
+    ``kuikae_meld`` 为刚鸣上的面子时，禁切食替牌后再选最优。
     """
     req = build_request(
         game_mode=1,
@@ -563,6 +625,8 @@ def _query_best(
         )
         if not cands:
             return {"error": "no candidates"}
+        if kuikae_meld is not None:
+            apply_kuikae_marks(cands, kuikae_meld)
         # 与切牌卡同口径：门控 + 防守调整效用后的最优切（决定本假设的 EV/和率）
         picked = policy_best_cut(cands, turn, opp=opp, defense=defense)
         if picked is None:
@@ -805,6 +869,7 @@ def evaluate_opportunity(
                     "action": action,
                     "consume_names": consume_names,
                     "new_hand": new_hand,
+                    "new_meld": new_meld,
                     "self_melds1": self_melds1,
                     "seen1": seen1,
                     "om1": om1,
@@ -826,6 +891,7 @@ def evaluate_opportunity(
             timeout,
             opp=opp,
             defense=defense,
+            kuikae_meld=spec.get("new_meld"),
         )
 
     variant_results: Dict[int, dict] = {}

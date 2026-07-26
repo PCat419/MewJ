@@ -148,31 +148,47 @@ def _cand_winp(c: Dict[str, Any]) -> float:
     return _as_float(v, 0.0)
 
 
+def _is_illegal_cut(c: Dict[str, Any]) -> bool:
+    """振听听牌或食替禁切：不参与姿态最低向听 / 合格池 / 推荐权重。"""
+    return bool(c.get("furiten") or c.get("kuikae"))
+
+
+def _legal_candidates(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [c for c in candidates if not _is_illegal_cut(c)]
+
+
 # 全弃：综合效用改为纯安全分 = −危险度×该系数（0% → 0，1.61% → −161）
 FOLD_SAFETY_SCALE = _P["posture"]["fold_safety_scale"]
 
 
 def _rescore_fold(ordered: List[Dict[str, Any]]) -> None:
     """全弃口径重算综合效用与推荐权重，使显示数字与危险度排序一致。"""
-    for c in ordered:
+    legal = _legal_candidates(ordered)
+    pool = legal or list(ordered)
+    for c in pool:
         c["adjusted_utility"] = -_cand_risk(c) * FOLD_SAFETY_SCALE
     weights = softmax_weights(
-        [c["adjusted_utility"] for c in ordered], DEFAULT_TEMPERATURE
+        [c["adjusted_utility"] for c in pool], DEFAULT_TEMPERATURE
     )
-    for c, w in zip(ordered, weights):
+    for c, w in zip(pool, weights):
         c["recommendation_weight"] = w
+    for c in ordered:
+        if c.get("kuikae"):
+            c["recommendation_weight"] = 0.0
+            c["policy_rejected"] = True
 
 
 def _rescore_maneuver(
     candidates: List[Dict[str, Any]], eligible: List[Dict[str, Any]]
 ) -> List[Dict[str, Any]]:
     """兜牌口径：安全线内按综合效用降序并重新 softmax；线外权重压底并排末。"""
+    eligible = [c for c in eligible if not _is_illegal_cut(c)]
     eligible.sort(
         key=lambda c: (_cand_utility(c), _cand_ev(c), _cand_uke(c)), reverse=True
     )
     weights = softmax_weights(
         [_cand_utility(c) for c in eligible], DEFAULT_TEMPERATURE
-    )
+    ) if eligible else []
     for c, w in zip(eligible, weights):
         c["recommendation_weight"] = w
     elig_ids = {id(c) for c in eligible}
@@ -181,6 +197,10 @@ def _rescore_maneuver(
     for c in rest:
         # 线外不占权重份额，保证合格池 softmax 之和仍为 100%
         c["recommendation_weight"] = 0.0
+    for c in candidates:
+        if c.get("kuikae"):
+            c["recommendation_weight"] = 0.0
+            c["policy_rejected"] = True
     return eligible + rest
 
 
@@ -194,6 +214,7 @@ def _rescore_keiten(
     risk_cost（相当于 risk_scale≈1 的近似）。池内重新 softmax，池外压底。
     best 为池内调整后效用最大者（即罚符收益口径下最低危的保听切）。
     """
+    eligible = [c for c in eligible if not _is_illegal_cut(c)]
     for c in eligible:
         credit = _as_float(c.get("noten_credit"), 0.0)
         scaled = c.get("risk_cost_scaled")
@@ -205,7 +226,7 @@ def _rescore_keiten(
     )
     weights = softmax_weights(
         [_cand_utility(c) for c in eligible], DEFAULT_TEMPERATURE
-    )
+    ) if eligible else []
     for c, w in zip(eligible, weights):
         c["recommendation_weight"] = w
     elig_ids = {id(c) for c in eligible}
@@ -214,6 +235,10 @@ def _rescore_keiten(
     for c in rest:
         # 线外不占权重份额，保证合格池 softmax 之和仍为 100%
         c["recommendation_weight"] = 0.0
+    for c in candidates:
+        if c.get("kuikae"):
+            c["recommendation_weight"] = 0.0
+            c["policy_rejected"] = True
     return eligible + rest
 
 
@@ -246,10 +271,9 @@ def trigger_threats(defense: Dict[str, Any], config: Optional[Dict[str, Any]] = 
 
 def _hand_strength(candidates: List[Dict[str, Any]]) -> tuple:
     """(最低向听, 该向听层最优候选的 EV, 其进张)。手牌强度的代表。"""
-    min_s = min(_cand_shanten(c) for c in candidates)
-    pool = [c for c in candidates if _cand_shanten(c) == min_s and not c.get("furiten")]
-    if not pool:
-        pool = [c for c in candidates if _cand_shanten(c) == min_s]
+    active = _legal_candidates(candidates) or list(candidates)
+    min_s = min(_cand_shanten(c) for c in active)
+    pool = [c for c in active if _cand_shanten(c) == min_s]
     best = max(pool, key=_cand_ev)
     return min_s, _cand_ev(best), _cand_uke(best)
 
@@ -300,7 +324,7 @@ def evaluate_posture(
             keep = [
                 c
                 for c in candidates
-                if _cand_shanten(c) <= 1 and not c.get("furiten")
+                if _cand_shanten(c) <= 1 and not _is_illegal_cut(c)
             ]
             if keep and min(_cand_risk(c) for c in keep) <= float(
                 cfg["maneuver_low_risk_cap"]
@@ -328,6 +352,7 @@ def evaluate_posture(
             c
             for c in candidates
             if _cand_shanten(c) <= min_s
+            and not _is_illegal_cut(c)
             and _cand_risk(c) <= k_cap
             and _as_float(c.get("noten_credit")) >= float(cfg["keiten_min_credit"])
         ]
@@ -340,11 +365,16 @@ def evaluate_posture(
     # 4 位 + 分差达到剩余局数门槛时拒绝全弃，至少兜牌追分。
     if no_fold:
         return Posture.MANEUVER
-    zero_risk = [c for c in candidates if _cand_risk(c) <= 1e-9]
+    zero_risk = [
+        c for c in candidates if not _is_illegal_cut(c) and _cand_risk(c) <= 1e-9
+    ]
     if zero_risk:
         return Posture.FOLD
     low_risk = [
-        c for c in candidates if _cand_risk(c) <= float(cfg["fold_low_risk_tile_cap"])
+        c
+        for c in candidates
+        if not _is_illegal_cut(c)
+        and _cand_risk(c) <= float(cfg["fold_low_risk_tile_cap"])
     ]
     if len(low_risk) >= 2:
         return Posture.FOLD
@@ -437,17 +467,16 @@ def apply_posture(
             if len(threats) >= 2
             else float(cfg["maneuver_danger_cap"])
         )
-        min_s = min(_cand_shanten(c) for c in candidates)
+        active = _legal_candidates(candidates) or list(candidates)
+        min_s = min(_cand_shanten(c) for c in active)
         # 已听牌（0 向听）允许退向到 1 向听，但拆听是质变，须过门控：
         # 和了率不降（真改良）/ EV 增益足够 / 显著更安全（安全阀）三选一。
         # 弱听死守不如退向好形的情形由 EV 增益或安全阀覆盖。
         max_s = min_s + 1 if min_s == 0 else min_s
         eligible = [
             c
-            for c in candidates
-            if _cand_shanten(c) <= max_s
-            and not c.get("furiten")
-            and _cand_risk(c) <= cap
+            for c in active
+            if _cand_shanten(c) <= max_s and _cand_risk(c) <= cap
         ]
         if min_s == 0:
             anchor_pool = [c for c in eligible if _cand_shanten(c) == 0]
@@ -476,11 +505,7 @@ def apply_posture(
                 eligible = [c for c in eligible if _retreat_ok(c)]
         if not eligible and no_fold:
             # 4 位追分禁止降级全弃：放宽危险上限，在同向听里打相对最安全的牌
-            eligible = [
-                c
-                for c in candidates
-                if _cand_shanten(c) <= max_s and not c.get("furiten")
-            ]
+            eligible = [c for c in active if _cand_shanten(c) <= max_s]
             eligible.sort(
                 key=lambda c: (
                     _cand_risk(c),
@@ -509,14 +534,15 @@ def apply_posture(
             if len(threats) >= 2
             else float(cfg["keiten_danger_cap"])
         )
-        min_s = min(_cand_shanten(c) for c in candidates)
+        active = _legal_candidates(candidates) or list(candidates)
+        min_s = min(_cand_shanten(c) for c in active)
         eligible = [
             c
-            for c in candidates
+            for c in active
             if _cand_shanten(c) <= min_s and _cand_risk(c) <= k_cap
         ]
         if not eligible and no_fold:
-            eligible = [c for c in candidates if _cand_shanten(c) <= min_s]
+            eligible = [c for c in active if _cand_shanten(c) <= min_s]
             eligible.sort(
                 key=lambda c: (
                     _cand_risk(c),
@@ -540,12 +566,9 @@ def apply_posture(
     if final is Posture.FOLD and no_fold:
         # 评估阶段已判追分，或兜牌/形听空池：强制留在兜牌，不进入全弃
         final = Posture.MANEUVER
-        min_s = min(_cand_shanten(c) for c in candidates)
-        eligible = [
-            c
-            for c in candidates
-            if _cand_shanten(c) <= min_s and not c.get("furiten")
-        ] or list(candidates)
+        active = _legal_candidates(candidates) or list(candidates)
+        min_s = min(_cand_shanten(c) for c in active)
+        eligible = [c for c in active if _cand_shanten(c) <= min_s] or list(active)
         eligible.sort(
             key=lambda c: (
                 _cand_risk(c),
@@ -563,6 +586,7 @@ def apply_posture(
         ordered = sorted(
             candidates,
             key=lambda c: (
+                1 if c.get("kuikae") else 0,
                 _cand_risk(c),
                 _cand_shanten(c),
                 -_cand_uke(c),
@@ -570,11 +594,20 @@ def apply_posture(
                 str(c.get("tile") or ""),
             ),
         )
-        _rescore_fold(ordered)
-        pick = ordered[0]
+        # 全弃推荐从合法切里取（食替沉底）
+        legal_ordered = _legal_candidates(ordered) or ordered
+        _rescore_fold(legal_ordered)
+        for c in ordered:
+            if c.get("kuikae"):
+                c["recommendation_weight"] = 0.0
+                c["policy_rejected"] = True
+        pick = legal_ordered[0]
+        # 保持全表顺序：合法按危险度，食替在末
         analysis["best"] = pick.get("tile")
-        analysis["candidates"] = ordered
-        analysis.update(_classify_fold(ordered, pick, actual, cfg))
+        analysis["candidates"] = legal_ordered + [
+            c for c in ordered if c.get("kuikae")
+        ]
+        analysis.update(_classify_fold(legal_ordered, pick, actual, cfg))
 
     analysis["posture"] = POSTURE_LABELS[final]
     analysis["posture_code"] = int(final)

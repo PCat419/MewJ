@@ -487,6 +487,11 @@ def render_classic_html(report: dict, tile_base: str = "../assets/tiles") -> str
                     mark += " actual"
                 if c.get("tile") == best:
                     mark += " best"
+                if c.get("policy_rejected") or c.get("kuikae"):
+                    mark += " rejected"
+                kuikae_badge = (
+                    '<span class="kuikae-badge">食替</span>' if c.get("kuikae") else ""
+                )
                 uke_cell = _uke_cell(c, tile_base)
                 exp_cell = (
                     "<td class='na'>—</td>"
@@ -501,7 +506,7 @@ def render_classic_html(report: dict, tile_base: str = "../assets/tiles") -> str
                 )
                 cand_rows += (
                     f"<tr class='{mark}'>"
-                    f"<td>{_tile_img(c.get('tile'), tile_base)}</td>"
+                    f"<td>{_tile_img(c.get('tile'), tile_base)}{kuikae_badge}</td>"
                     f"<td>{_esc(c.get('shanten'))}</td>"
                     f"{uke_cell}{exp_cell}{deal_cell}{utility_cell}{weight_cell}"
                     f"</tr>"
@@ -917,6 +922,11 @@ table.cand .uke-badge.risk {{
 table.cand .furiten-badge {{
   display:inline-block; margin-left:.35rem; padding:.05rem .35rem;
   font-size:.68rem; font-weight:700; color:#b91c1c; background:#fee2e2;
+  border-radius:4px; vertical-align:middle;
+}}
+table.cand .kuikae-badge {{
+  display:inline-block; margin-left:.35rem; padding:.05rem .35rem;
+  font-size:.68rem; font-weight:700; color:#9f1239; background:#ffe4e6;
   border-radius:4px; vertical-align:middle;
 }}
 table.riichi tr .deal-in.safe {{ color:var(--ok); font-weight:700; }}
