@@ -1376,9 +1376,65 @@ def _review_paipu_body(
                 if ana.get("ok"):
                     posture = advance(posture, evaluate_posture(ana))
                     posture = apply_posture(ana, posture)
+                    # 先制立直判断（附加轴）：0 向听时切牌表含立直权重
+                    from . import riichi_eval
+
+                    rd = riichi_eval.evaluate_declare(dp, ana, posture=posture)
+                    ana["riichi_declare"] = rd
+                    # 立直线一致/不一致覆盖切牌卡判定：
+                    # - 都立直 → 本巡一致（切哪张交给后续立直卡）
+                    # - 立/默分歧 → 本巡不一致（覆盖切牌「尚可」）
+                    if (
+                        rd.get("recommend") == "riichi"
+                        and bool(dp.is_riichi_discard)
+                    ):
+                        ana["match"] = True
+                        ana["match_kind"] = "same"
+                    elif rd.get("match") is False:
+                        ana["match"] = False
+                        ana["match_kind"] = "different"
             except Exception as exc:
                 entry["analysis"] = {"ok": False, "error": str(exc)}
             decisions_out.append(entry)
+            # 仅玩家实际立直时，追加立直切牌卡
+            rd = (entry.get("analysis") or {}).get("riichi_declare") or {}
+            if (
+                bool(dp.is_riichi_discard)
+                and rd.get("ok", True)
+                and not rd.get("skipped")
+                and rd.get("riichi_cuts")
+            ):
+                tile_match = rd.get("tile_match")
+                decisions_out.append(
+                    {
+                        "kind": "riichi",
+                        "label": f"{dp.label} 立直",
+                        "turn": dp.turn,
+                        "hand": dp.hand,
+                        "drawn_tile": dp.drawn_tile,
+                        "melds": dp.melds,
+                        "dora": dp.dora_indicators,
+                        "round_wind": dp.round_wind,
+                        "seat_wind": dp.seat_wind,
+                        "actual": dp.actual_discard,
+                        "is_riichi": True,
+                        "analysis": {
+                            "ok": True,
+                            "riichi_cuts": rd.get("riichi_cuts") or [],
+                            "riichi_tile": rd.get("riichi_tile"),
+                            "recommend_tile": rd.get("riichi_tile"),
+                            "match": tile_match,
+                            "match_kind": (
+                                "same"
+                                if tile_match is True
+                                else "different"
+                                if tile_match is False
+                                else None
+                            ),
+                        },
+                        "skipped": False,
+                    }
+                )
 
         report_kyokus.append(
             {

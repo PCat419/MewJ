@@ -252,6 +252,178 @@ def _fmt_win(value) -> str:
         return str(value)
 
 
+def _riichi_merged_cand_rows(
+    analysis: dict,
+    rd: dict,
+    tile_base: str,
+    *,
+    actual_tile: Any,
+    is_riichi: bool,
+    show_uke_only: bool,
+) -> str:
+    """牌效表：立直元动作 + 全部切牌，共用 line_options 权重。"""
+    line_opts = list(rd.get("line_options") or [])
+    if not line_opts:
+        return ""
+    by_tile = {
+        str(c.get("tile")): c for c in (analysis.get("candidates") or []) if c.get("tile")
+    }
+    rec = rd.get("recommend")
+    dama_tile = rd.get("dama_tile")
+    actual_n = str(actual_tile or "")
+
+    def _sort_key(o: dict):
+        w = o.get("recommendation_weight")
+        return -(float(w) if w is not None else -1.0)
+
+    line_opts.sort(key=_sort_key)
+    rows = ""
+    for o in line_opts:
+        action = o.get("action")
+        mark = ""
+        if action == "riichi":
+            if rec == "riichi":
+                mark += " best"
+            if is_riichi:
+                mark += " actual"
+            label = "立直"
+            shanten_cell = "<td>—</td>"
+            uke_cell = "<td class='uke'>—</td>"
+            exp_cell = "<td class='na'>—</td>" if show_uke_only else "<td>—</td>"
+            deal_cell = "<td>—</td>"
+        else:
+            tile = o.get("tile")
+            c = by_tile.get(str(tile)) or {}
+            if rec == "dama" and tile == dama_tile:
+                mark += " best"
+            if (not is_riichi) and str(tile) == actual_n:
+                mark += " actual"
+            if c.get("policy_rejected") or c.get("kuikae") or o.get("policy_rejected"):
+                mark += " rejected"
+            kuikae_badge = (
+                '<span class="kuikae-badge">食替</span>' if c.get("kuikae") else ""
+            )
+            label = f"打 {_tile_img(tile, tile_base)}{kuikae_badge}"
+            shanten_cell = f"<td>{_esc(c.get('shanten') if c.get('shanten') is not None else o.get('shanten'))}</td>"
+            uke_cell = _uke_cell(c, tile_base) if c else "<td class='uke'>—</td>"
+            exp_cell = (
+                "<td class='na'>—</td>"
+                if show_uke_only
+                else f"<td>{_fmt_score(c.get('exp_score') if c else o.get('exp_score'))}</td>"
+            )
+            deal = (c.get("deal_in") or {}) if c else {}
+            deal_cell = _deal_in_cell(deal.get("combined"))
+        rows += (
+            f"<tr class='{mark}'>"
+            f"<td>{label}</td>"
+            f"{shanten_cell}{uke_cell}{exp_cell}{deal_cell}"
+            f"<td>{_fmt_score(o.get('adjusted_utility'))}</td>"
+            f"<td class='weight'>{_fmt_weight(o.get('recommendation_weight'))}</td>"
+            f"</tr>"
+        )
+    return rows
+
+
+def _riichi_cut_turn_html(d: dict, ky: dict, tile_base: str, seq: int):
+    """立直切牌独立卡（对标副露卡）：仅合法立直后切牌。"""
+    analysis = d.get("analysis") or {}
+    actual = d.get("actual")
+    match = analysis.get("match")
+    if match is True:
+        badge = '<span class="badge ok">✓ 一致</span>'
+        status = "s-ok"
+    elif match is False:
+        badge = '<span class="badge diff">✗ 不一致</span>'
+        status = "s-diff"
+    elif analysis.get("error") or (analysis and analysis.get("ok") is False):
+        badge = (
+            f'<span class="badge err">'
+            f'{_esc(analysis.get("error") or "评估失败")}</span>'
+        )
+        status = "s-err"
+    else:
+        badge = '<span class="badge muted">未立直</span>'
+        status = "s-skip"
+
+    rec_tile = analysis.get("recommend_tile") or analysis.get("riichi_tile")
+    recommend = ""
+    if rec_tile:
+        recommend = f'<span class="rec">推荐：{_tile_img(rec_tile, tile_base)}</span>'
+
+    actual_chip = (
+        f'<span class="meta-item">玩家：{_tile_img(actual, tile_base)}</span>'
+        if actual
+        else '<span class="meta-item">玩家：—</span>'
+    )
+
+    cuts = list(analysis.get("riichi_cuts") or [])
+    cuts.sort(
+        key=lambda c: -(
+            float(c["recommendation_weight"])
+            if c.get("recommendation_weight") is not None
+            else -1.0
+        )
+    )
+    body = ""
+    for c in cuts:
+        tile = c.get("tile")
+        mark = ""
+        if tile == rec_tile:
+            mark += " best"
+        if actual and tile == actual:
+            mark += " actual"
+        furiten_badge = (
+            '<span class="furiten-badge">振听</span>' if c.get("furiten") else ""
+        )
+        deal = c.get("deal_in") or {}
+        body += (
+            f"<tr class='{mark}'>"
+            f"<td>打 {_tile_img(tile, tile_base)}{furiten_badge}</td>"
+            f"<td>{_fmt_score(c.get('exp_score'))}</td>"
+            f"<td>{_fmt_win(c.get('win_prob'))}</td>"
+            f"{_deal_in_cell(deal.get('combined'))}"
+            f"<td>{_fmt_score(c.get('adjusted_utility'))}</td>"
+            f"<td class='weight'>{_fmt_weight(c.get('recommendation_weight'))}</td>"
+            f"</tr>"
+        )
+    detail = ""
+    if body:
+        detail = f"""
+                    <div class="legend">
+                      <span><i class="lg best-lg"></i>推荐</span>
+                      <span><i class="lg actual-lg"></i>玩家</span>
+                    </div>
+                    <div class="table-scroll"><table class="cand">
+                      <thead><tr>
+                        <th>选项</th><th>牌效EV</th><th>和率</th>
+                        <th>综合危险度</th><th>综合效用</th><th>推荐权重</th>
+                      </tr></thead>
+                      <tbody>{body}</tbody>
+                    </table></div>"""
+
+    tid = f"t{ky.get('index')}_{d.get('turn')}_riichi_{seq}"
+    turn_open = " open" if match is False else ""
+    row = f"""
+                <details class="turn {status}" id="{tid}"{turn_open}>
+                  <summary class="turn-head">
+                    <strong>{_esc(d.get('label') or '立直')}</strong>
+                    {badge}
+                    <span class="meta">
+                      {actual_chip}
+                      {recommend}
+                    </span>
+                  </summary>
+                  <div class="turn-body">
+                    <div class="handline">
+                      <span class="label">手牌</span> {_hand_span(d.get('hand'), tile_base, d.get('drawn_tile'))}
+                      {_melds_html(d.get('melds') or [], tile_base)}
+                    </div>
+                    {detail}
+                  </div>
+                </details>"""
+    return row, (tid, "立直", status)
+
+
 def _call_turn_html(d: dict, ky: dict, tile_base: str, seq: int):
     """副露决策点卡片：碰/吃 vs 跳过的反事实对比表。"""
     analysis = d.get("analysis") or {}
@@ -413,6 +585,7 @@ def render_classic_html(report: dict, tile_base: str = "../assets/tiles") -> str
         rows = []
         nav_items = []
         call_seq = 0
+        riichi_seq = 0
         for d in ky.get("decisions") or []:
             analysis = d.get("analysis") or {}
             best = analysis.get("best") if analysis.get("ok") else None
@@ -431,6 +604,14 @@ def render_classic_html(report: dict, tile_base: str = "../assets/tiles") -> str
                 rows.append(row_html)
                 nav_items.append(nav_item)
                 call_seq += 1
+                continue
+            if d.get("kind") == "riichi":
+                row_html, nav_item = _riichi_cut_turn_html(
+                    d, ky, tile_base, riichi_seq
+                )
+                rows.append(row_html)
+                nav_items.append(nav_item)
+                riichi_seq += 1
                 continue
             if match is True:
                 badge_text = (
@@ -471,46 +652,66 @@ def render_classic_html(report: dict, tile_base: str = "../assets/tiles") -> str
 
             cand_rows = ""
             show_uke_only = analysis.get("calc_stats") is False
-            # 候选按推荐权重降序渲染（权重=综合效用 softmax，与推荐徽标口径一致；
-            # 无权重时保持原顺序，即向听数→牌效EV）
-            _cands = list(analysis.get("candidates") or [])
-            if any(c.get("recommendation_weight") is not None for c in _cands):
-                _cands.sort(
-                    key=lambda c: c.get("recommendation_weight")
-                    if c.get("recommendation_weight") is not None
-                    else -1.0,
-                    reverse=True,
+            rd = analysis.get("riichi_declare") if analysis else None
+            rd_active = (
+                isinstance(rd, dict)
+                and rd.get("ok", True)
+                and not rd.get("skipped")
+                and (rd.get("line_options") or rd.get("recommend") is not None)
+            )
+            if rd_active:
+                cand_rows = _riichi_merged_cand_rows(
+                    analysis,
+                    rd,
+                    tile_base,
+                    actual_tile=actual,
+                    is_riichi=bool(d.get("is_riichi")),
+                    show_uke_only=show_uke_only,
                 )
-            for c in _cands:
-                mark = ""
-                if c.get("tile") == actual:
-                    mark += " actual"
-                if c.get("tile") == best:
-                    mark += " best"
-                if c.get("policy_rejected") or c.get("kuikae"):
-                    mark += " rejected"
-                kuikae_badge = (
-                    '<span class="kuikae-badge">食替</span>' if c.get("kuikae") else ""
-                )
-                uke_cell = _uke_cell(c, tile_base)
-                exp_cell = (
-                    "<td class='na'>—</td>"
-                    if show_uke_only
-                    else f"<td>{_fmt_score(c.get('exp_score'))}</td>"
-                )
-                deal = c.get("deal_in") or {}
-                deal_cell = _deal_in_cell(deal.get("combined"))
-                utility_cell = f"<td>{_fmt_score(c.get('adjusted_utility'))}</td>"
-                weight_cell = (
-                    f"<td class='weight'>{_fmt_weight(c.get('recommendation_weight'))}</td>"
-                )
-                cand_rows += (
-                    f"<tr class='{mark}'>"
-                    f"<td>{_tile_img(c.get('tile'), tile_base)}{kuikae_badge}</td>"
-                    f"<td>{_esc(c.get('shanten'))}</td>"
-                    f"{uke_cell}{exp_cell}{deal_cell}{utility_cell}{weight_cell}"
-                    f"</tr>"
-                )
+            else:
+                # 候选按推荐权重降序渲染（权重=综合效用 softmax，与推荐徽标口径一致；
+                # 无权重时保持原顺序，即向听数→牌效EV）
+                _cands = list(analysis.get("candidates") or [])
+                if any(c.get("recommendation_weight") is not None for c in _cands):
+                    _cands.sort(
+                        key=lambda c: c.get("recommendation_weight")
+                        if c.get("recommendation_weight") is not None
+                        else -1.0,
+                        reverse=True,
+                    )
+                for c in _cands:
+                    mark = ""
+                    if c.get("tile") == actual:
+                        mark += " actual"
+                    if c.get("tile") == best:
+                        mark += " best"
+                    if c.get("policy_rejected") or c.get("kuikae"):
+                        mark += " rejected"
+                    kuikae_badge = (
+                        '<span class="kuikae-badge">食替</span>'
+                        if c.get("kuikae")
+                        else ""
+                    )
+                    uke_cell = _uke_cell(c, tile_base)
+                    exp_cell = (
+                        "<td class='na'>—</td>"
+                        if show_uke_only
+                        else f"<td>{_fmt_score(c.get('exp_score'))}</td>"
+                    )
+                    deal = c.get("deal_in") or {}
+                    deal_cell = _deal_in_cell(deal.get("combined"))
+                    utility_cell = f"<td>{_fmt_score(c.get('adjusted_utility'))}</td>"
+                    weight_cell = (
+                        f"<td class='weight'>"
+                        f"{_fmt_weight(c.get('recommendation_weight'))}</td>"
+                    )
+                    cand_rows += (
+                        f"<tr class='{mark}'>"
+                        f"<td>{_tile_img(c.get('tile'), tile_base)}{kuikae_badge}</td>"
+                        f"<td>{_esc(c.get('shanten'))}</td>"
+                        f"{uke_cell}{exp_cell}{deal_cell}{utility_cell}{weight_cell}"
+                        f"</tr>"
+                    )
 
             detail = ""
             if cand_rows or analysis.get("defense") or analysis.get("defense_error"):
@@ -519,6 +720,12 @@ def render_classic_html(report: dict, tile_base: str = "../assets/tiles") -> str
                     "<th>综合危险度</th><th>综合效用</th><th>推荐权重</th>"
                 )
                 if cand_rows:
+                    # 含立直元动作时首列标题改为「选项」
+                    if rd_active:
+                        head = (
+                            "<th>选项</th><th>向听数</th><th>进张</th><th>牌效EV</th>"
+                            "<th>综合危险度</th><th>综合效用</th><th>推荐权重</th>"
+                        )
                     eff_panel = f"""
                     <div class="legend">
                       <span><i class="lg best-lg"></i>推荐</span>
@@ -549,8 +756,25 @@ def render_classic_html(report: dict, tile_base: str = "../assets/tiles") -> str
                 detail = f"<div class='err'>{_esc(analysis.get('error'))}</div>"
 
             recommend = ""
-            if best:
+            if rd_active:
+                if rd.get("recommend") == "riichi":
+                    recommend = '<span class="rec">推荐：立直</span>'
+                else:
+                    dt = rd.get("dama_tile") or best
+                    if dt:
+                        recommend = (
+                            f'<span class="rec">推荐：{_tile_img(dt, tile_base)}</span>'
+                        )
+            elif best:
                 recommend = f'<span class="rec">推荐：{_tile_img(best, tile_base)}</span>'
+
+            # 立直判断巡：玩家侧只标「立直」，不重复显示切牌（切牌交给后续立直卡）
+            if d.get("is_riichi"):
+                player_chip = '<span class="meta-item">玩家：立直</span>'
+            else:
+                player_chip = (
+                    f'<span class="meta-item">玩家：{_tile_img(actual, tile_base)}</span>'
+                )
 
             tid = f"t{ky.get('index')}_{d.get('turn')}"
             short = str(d.get("label") or "").split()[-1] or f"第{d.get('turn')}巡"
@@ -567,12 +791,10 @@ def render_classic_html(report: dict, tile_base: str = "../assets/tiles") -> str
                   <summary class="turn-head">
                     <strong>{_esc(d.get('label'))}</strong>
                     {badge}
-                    {posture_badge}
                     <span class="meta">
-                      <span class="meta-item">玩家：{_tile_img(actual, tile_base)}</span>
-                      {'<span class="flag">立直</span>' if d.get("is_riichi") else ""}
-                      {'<span class="flag">摸切</span>' if d.get("is_tsumogiri") else ""}
+                      {player_chip}
                       {recommend}
+                      {posture_badge}
                     </span>
                   </summary>
                   <div class="turn-body">
@@ -974,7 +1196,7 @@ table.riichi tr .deal-in.safe {{ color:var(--ok); font-weight:700; }}
 <body>
 <header>
   <div class="head-inner">
-    <h1>🀄 MewJ 牌谱检讨</h1>
+    <h1>MewJ 牌谱检讨</h1>
     {stats_html}
   </div>
 </header>
@@ -986,7 +1208,7 @@ table.riichi tr .deal-in.safe {{ color:var(--ok); font-weight:700; }}
     </aside>
     <div class="content">
       {"".join(sections)}
-      <div class="foot">MewJ · Classic 牌谱检讨报告</div>
+      <div class="foot">MewJ 牌谱检讨报告</div>
     </div>
   </div>
 </main>
