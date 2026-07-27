@@ -4,6 +4,8 @@ paipu/
 __pycache__/
 *.pyc
 .venv/
+# 本地开发脚本、回归对比、临时实验（不进正式包）
+dev/
 # 引擎运行时在 engine/ 旁写的日志与崩溃转储
 engine/log.txt
 engine/crash_*.txt

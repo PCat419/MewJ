@@ -363,6 +363,33 @@ def _honba_from_dp(dp: Any) -> int:
     return _as_int(meta[1]) if len(meta) > 1 else 0
 
 
+def _kyoutaku_sticks(dp: Any) -> int:
+    """桌上供托棒数 = 开局携带 + 本局决策点之前已宣言立直。
+
+    不含本巡即将宣言的那根（DecisionPoint 在切牌入河之前产出）。
+    """
+    meta = getattr(dp, "kyoku_meta", None) or []
+    carry = _as_int(meta[2]) if len(meta) > 2 else 0
+    declared = sum(
+        1 for e in (getattr(dp, "discards_log", None) or []) if e.get("riichi")
+    )
+    return max(0, carry) + max(0, declared)
+
+
+def _kyoutaku_credit(sticks: int, win_prob: Any) -> float:
+    """供托期望点：sticks × stick_value × win_prob。禁用或无效和率时为 0。"""
+    if not bool(_S.get("kyoutaku_enabled", True)):
+        return 0.0
+    n = max(0, _as_int(sticks))
+    if n <= 0:
+        return 0.0
+    wp = min(1.0, max(0.0, _as_float(win_prob)))
+    if wp <= 0.0:
+        return 0.0
+    value = _as_float(_S.get("kyoutaku_stick_value"), 1000.0)
+    return n * value * wp
+
+
 def _scores_from_dp(dp: Any) -> List[int]:
     raw = getattr(dp, "scores", None) or []
     scores = [_as_int(value) for value in raw]
@@ -466,6 +493,7 @@ def score_candidates(
     alphas = defense.get("alphas") or {}
     combined_all = defense.get("combined") or {}
     honba = _honba_from_dp(dp)
+    kyoutaku_sticks = _kyoutaku_sticks(dp)
     self_wind = getattr(dp, "seat_wind", "east")
 
     # 终盘 nanikiru 对全体候选返回 exp_score≈0（而非 None），此时逐候选的
@@ -618,6 +646,9 @@ def score_candidates(
         else:
             noten_credit, noten_components = 0.0, None
         utility += noten_credit
+        # 供托期望：nanikiru exp_score 不含桌上立直棒，按棒数×1000×和率补缺口
+        kyoutaku_credit = _kyoutaku_credit(kyoutaku_sticks, candidate.get("win_prob"))
+        utility += kyoutaku_credit
         candidate["offense_ev"] = offense
         candidate["offense_fallback"] = group_fallback
         candidate["combined_risk"] = combined
@@ -628,6 +659,8 @@ def score_candidates(
         candidate["chiitoitsu_tiebreak"] = chiitoitsu_tiebreak
         candidate["noten_credit"] = noten_credit
         candidate["noten_components"] = noten_components
+        candidate["kyoutaku_sticks"] = kyoutaku_sticks
+        candidate["kyoutaku_credit"] = kyoutaku_credit
         candidate["adjusted_utility"] = utility
         candidate["model_confidence"] = confidence
         candidate["offensive_desire"] = desire

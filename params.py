@@ -178,6 +178,9 @@ PARAMS = {
         "furo_loss_dealer": 5800.0,
         # 每场叠加的本场奖励
         "honba_bonus": 300.0,
+        # 供托（立直棒）期望：nanikiru exp_score 不含桌上棒，按 sticks×value×和率注入效用
+        "kyoutaku_enabled": True,
+        "kyoutaku_stick_value": 1000.0,
         # 进攻欲隐藏旋钮：1.0 中性，低偏守高偏攻
         "min_offensive_desire": 0.45,
         "max_offensive_desire": 1.75,
