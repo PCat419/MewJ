@@ -70,7 +70,12 @@ _FIVE_RED_PAIR = {4: 34, 13: 35, 22: 36, 34: 4, 35: 13, 36: 22}  # 5m/5p/5s <-> 
 
 # 引擎查询韧性：复杂手形双开 flag 会栈溢出/挂起（已知行为），按序降级重试；
 # 最后一档双关是保底，避免副露跳过侧摸牌枚举把整局拖死。
+# 副露检讨查询量大（见 _query_best）：
+#   切后向听 ≥2 → 关退向（引擎本身 ≥3 才关）；
+#   切后向听 ≥3 → 连手替也关（3 向听散牌开手替易把进程打崩，对副露相对判定影响很小）。
 _FLAG_ATTEMPTS = ((True, True), (True, False), (False, True), (False, False))
+_FLAG_ATTEMPTS_NO_SHANTEN_DOWN = ((True, False), (False, False))
+_FLAG_ATTEMPTS_NO_TEGAWARI = ((False, False),)
 
 
 def legal_calls(hand_counter: Counter, disc_tile: int, from_kamicha: bool) -> dict:
@@ -557,6 +562,17 @@ def _top3_cache(cands: List[dict], turn: int) -> List[dict]:
     ]
 
 
+def _min_cut_shanten(hand_tiles: List[str], n_meld: int = 0) -> int:
+    """查询手牌的最低切后向听（14/11 张需切一张；13/10 张直接算）。"""
+    if len(hand_tiles) % 3 != 2:
+        return local_shanten(hand_tiles, n_meld)
+    best = 99
+    for i in range(len(hand_tiles)):
+        after = hand_tiles[:i] + hand_tiles[i + 1 :]
+        best = min(best, local_shanten(after, n_meld))
+    return best
+
+
 def _query_best(
     hand_tiles: List[str],
     melds: List[dict],
@@ -581,7 +597,18 @@ def _query_best(
     success:false + err_msg 视为该次失败，不重试。
     ``defense`` 非空时选切计入危险度与罚符信用（与切牌卡一致）。
     ``kuikae_meld`` 为刚鸣上的面子时，禁切食替牌后再选最优。
+    切后向听 ≥2 时关闭退向；≥3 时连手替也关（防散牌手替栈溢出）。
     """
+    n_meld = len(melds)
+    cut_sh = _min_cut_shanten(hand_tiles, n_meld)
+    # ≥2 关退向；≥3 再关手替（副露查询多，优先稳与相对判定）
+    if cut_sh >= 3:
+        flag_attempts = _FLAG_ATTEMPTS_NO_TEGAWARI
+    elif cut_sh >= 2:
+        flag_attempts = _FLAG_ATTEMPTS_NO_SHANTEN_DOWN
+    else:
+        flag_attempts = _FLAG_ATTEMPTS
+
     req = build_request(
         game_mode=1,
         round_wind=round_wind,
@@ -599,9 +626,9 @@ def _query_best(
     if isinstance(wall, list):
         _furiten_wall_zero(wall, self_discards)
     last_exc: Optional[BaseException] = None
-    n_flags = len(_FLAG_ATTEMPTS)
+    n_flags = len(flag_attempts)
     url = pick_url(nanikiru_url)
-    for i, (teg, sd) in enumerate(_FLAG_ATTEMPTS):
+    for i, (teg, sd) in enumerate(flag_attempts):
         req["enable_tegawari"] = teg
         req["enable_shanten_down"] = sd
         try:
@@ -619,7 +646,6 @@ def _query_best(
             continue
         if raw.get("success", True) is False and raw.get("err_msg"):
             return {"error": raw.get("err_msg")}
-        n_meld = len(melds)
         cands = _build_cut_candidates(
             raw, turn, self_discards, hand_tiles=hand_tiles, n_meld=n_meld
         )

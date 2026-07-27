@@ -84,9 +84,14 @@ PARAMS = {
         # 强度稍欠（EV 1500~2000）的 1 向听：仅当存在 ≤cap 的低风险维持牌时才放行兜牌
         "maneuver_min_ev_low_risk": 1500.0,
         "maneuver_low_risk_cap": 0.02,
-        # 兜牌可接受的单牌综合危险度上限（多威胁时收紧）
+        # 兜牌可接受的单牌综合危险度上限（多威胁时收紧）。
+        # 随最低向听层最优 EV 线性放宽：EV≤ev_lo → 用地板；EV≥ev_hi(=high_ev) → 用天花板。
         "maneuver_danger_cap": 0.05,
         "maneuver_danger_cap_multi": 0.03,
+        "maneuver_danger_cap_max": 0.10,
+        "maneuver_danger_cap_multi_max": 0.06,
+        "maneuver_danger_cap_ev_lo": 2000.0,
+        "maneuver_danger_cap_ev_hi": 5000.0,
         # 触发姿态评估的最小副露数（单副露不触发）
         "min_furo_trigger": 2,
         # ≥ 该副露数视为硬威胁（≈立直，可判全弃）；仅 2 副露为软威胁（地板兜牌）

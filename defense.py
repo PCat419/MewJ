@@ -2,10 +2,9 @@
 
 Threats: riichi and/or open-meld opponents only (no damaten).
 Genbutsu cutoff: riichi declaration seq, or last discard after first open meld.
-Riichi: visible tiles + wait shapes + suji priors.
-Furo: danger rises with the number of open melds; four melds force tanki.
-1/2 副露的 α 随巡目线性爬升，至 furo_alpha_full_turn（默认 12）达上限；
-3/4 副露与立直不缩放。
+Riichi and 1–3 副露: visible tiles + wait shapes + suji exclusion (两面筋硬排除).
+Four melds force tanki. 1/2 副露的 α 随巡目线性爬升，至 furo_alpha_full_turn
+（默认 12）达上限；3/4 副露与立直不缩放。
 Combined: weighted soft-OR (α_riichi=1, α_furo depends on meld count × turn).
 
 Values are normalized relative-danger indices, not calibrated deal-in rates.
@@ -144,12 +143,13 @@ def _apply_tile_factors(
     return {tile: weighted[tile] / total for tile in ALL_TILES}
 
 
-def _riichi_risk(
+def _wait_shape_risk(
     genbutsu: Set[str],
     remaining: Dict[str, int],
     seat: str,
     log: List[dict],
 ) -> Dict[str, Any]:
+    """听牌形相对危险度（立直 / 1–3 副露共用）：含两面筋硬排除。"""
     discards = [
         normalize_tile(e.get("tile") or "")
         for e in log
@@ -247,23 +247,25 @@ def compute_defense(dp: DecisionPoint) -> Dict[str, Any]:
     for th in threats:
         gb = _genbutsu(log, th["seat"], th["cutoff"])
         if th["kind"] == "riichi":
-            modeled = _riichi_risk(gb, remaining, th["seat"], log)
+            modeled = _wait_shape_risk(gb, remaining, th["seat"], log)
             probs = modeled["probs"]
             details = modeled["details"]
             model = "wait-shape"
             confidence = "medium"
         else:
             furo_count = int(th.get("furo_count") or 1)
-            probs = (
-                _tanki_risk(gb, remaining)
-                if furo_count >= 4
-                else _uniform_risk(gb, remaining)
-            )
-            details = {}
-            model = "forced-tanki" if furo_count >= 4 else "visible-uniform"
-            confidence = "high" if furo_count >= 4 else (
-                "medium" if furo_count == 3 else "low"
-            )
+            if furo_count >= 4:
+                probs = _tanki_risk(gb, remaining)
+                details = {}
+                model = "forced-tanki"
+                confidence = "high"
+            else:
+                # 1–3 副露：与立直同口径听牌形 + 两面筋排除（现物仍为 0）
+                modeled = _wait_shape_risk(gb, remaining, th["seat"], log)
+                probs = modeled["probs"]
+                details = modeled["details"]
+                model = "wait-shape"
+                confidence = "medium" if furo_count == 3 else "low"
         base_probs = dict(probs)
         heuristic = analyze_danger_signals(dp, th["seat"])
         probs = _apply_tile_factors(

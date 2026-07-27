@@ -278,6 +278,30 @@ def _hand_strength(candidates: List[Dict[str, Any]]) -> tuple:
     return min_s, _cand_ev(best), _cand_uke(best)
 
 
+def _maneuver_danger_cap(
+    cfg: Dict[str, Any],
+    threats: List[Dict[str, Any]],
+    hand_ev: float,
+) -> float:
+    """兜牌危险度上限：随最低向听最优 EV 在 [base, max] 线性放宽。"""
+    multi = len(threats) >= 2
+    base = float(
+        cfg["maneuver_danger_cap_multi"] if multi else cfg["maneuver_danger_cap"]
+    )
+    hi = float(
+        cfg["maneuver_danger_cap_multi_max"]
+        if multi
+        else cfg["maneuver_danger_cap_max"]
+    )
+    lo_ev = float(cfg["maneuver_danger_cap_ev_lo"])
+    hi_ev = float(cfg["maneuver_danger_cap_ev_hi"])
+    if hi_ev <= lo_ev:
+        return hi if float(hand_ev) >= hi_ev else base
+    t = (float(hand_ev) - lo_ev) / (hi_ev - lo_ev)
+    t = max(0.0, min(1.0, t))
+    return base + (hi - base) * t
+
+
 def evaluate_posture(
     analysis: Dict[str, Any],
     config: Optional[Dict[str, Any]] = None,
@@ -462,13 +486,9 @@ def apply_posture(
 
     if posture is Posture.MANEUVER:
         threats = trigger_threats(analysis.get("defense") or {}, cfg)
-        cap = (
-            float(cfg["maneuver_danger_cap_multi"])
-            if len(threats) >= 2
-            else float(cfg["maneuver_danger_cap"])
-        )
         active = _legal_candidates(candidates) or list(candidates)
-        min_s = min(_cand_shanten(c) for c in active)
+        min_s, hand_ev, _ = _hand_strength(candidates)
+        cap = _maneuver_danger_cap(cfg, threats, hand_ev)
         # 已听牌（0 向听）允许退向到 1 向听，但拆听是质变，须过门控：
         # 和了率不降（真改良）/ EV 增益足够 / 显著更安全（安全阀）三选一。
         # 弱听死守不如退向好形的情形由 EV 增益或安全阀覆盖。
