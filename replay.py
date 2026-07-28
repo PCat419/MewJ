@@ -234,8 +234,8 @@ class DecisionPoint:
     dora_indicators: List[str]
     round_wind: str
     seat_wind: str
-    actual_discard: str  # mpsz
-    actual_discard_raw: Union[int, str]
+    actual_discard: Optional[str]  # mpsz；实加杠巡为 None
+    actual_discard_raw: Optional[Union[int, str]]
     is_riichi_discard: bool
     is_tsumogiri: bool
     scores: List[int]
@@ -249,6 +249,14 @@ class DecisionPoint:
     discards_log: list = field(default_factory=list)
     # 各家首次副露完成时，被吃碰杠的那张牌的全局 seq（副露后切牌 seq 必大于此）
     open_after_seq: dict = field(default_factory=dict)  # rel → int
+    # 加杠：合法选项 [{tile, pon_index}, ...]；实加杠时 actual_kakan 为消耗牌
+    legal_kakans: list = field(default_factory=list)
+    actual_kakan: Optional[str] = None
+    # 暗杠：合法选项 [{tiles, kind}, ...]；实暗杠时 actual_ankan 为代表牌
+    legal_ankans: list = field(default_factory=list)
+    actual_ankan: Optional[str] = None
+    # 立直后仅暗杠窗口产点（强制摸切不检讨，只对照杠）
+    is_riichi_post: bool = False
 
 
 @dataclass
@@ -268,7 +276,7 @@ class CallOpportunity:
     discarder: int  # 打出被副露牌的绝对座位
     discarder_rel: str  # 相对自家：上家/对家/下家
     disc_tile: str  # 被副露牌 mpsz
-    legal: dict  # legal_calls 结果：{"pon": [...], "chii": [...], "daiminkan": bool}
+    legal: dict  # legal_calls 结果：{"pon": [...], "chii": [...], "daiminkan": [...]}
     actual: str  # pon / chii / daiminkan / skip
     actual_tiles: List[str]  # 实际副露消耗的手牌 mpsz（skip 为 []）
     label: str
@@ -431,8 +439,10 @@ def iter_seat_decisions(
     include_calls=True 时，在他家舍牌且自家有合法碰/吃/杠窗口处，按时间顺序
     额外 yield CallOpportunity（位于两个自家 DecisionPoint 之间）。
     """
+    # 延迟 import：call_eval 依赖本模块，避免循环
+    from .call_eval import legal_ankans, legal_kakans
+
     if include_calls:
-        # 延迟 import：call_eval 依赖本模块的 CallOpportunity，避免循环
         from .call_eval import legal_calls
     else:
         legal_calls = None
@@ -453,7 +463,7 @@ def iter_seat_decisions(
     last_drawn: List[Optional[int]] = [None, None, None, None]
     global_seq = 0
     discards_log: List[dict] = []
-    # 自家一旦宣言立直，其后均为强制摸切巡，无决策空间，直接截断（与 mortal 一致）
+    # 自家立直后：普通摸切不产点；仅暗杠窗口产决策点（待牌不变闸在评估侧）
     self_riichi = False
     # abs seat → seq of the discard that was called into their first open meld
     first_open_after: List[Optional[int]] = [None, None, None, None]
@@ -519,9 +529,92 @@ def iter_seat_decisions(
             i_c[actor] += 1
             parsed = parse_meld_token(str(peek))
             if parsed.type == "ankan":
+                # 实暗杠前产出决策点（对照切牌/暗杠；立直后亦产）
+                if actor == seat:
+                    hand_now = _hand_list(hands[actor])
+                    hand_mpsz = sort_hand_mpsz(mpsz_list(hand_now))
+                    melds_now = [dict(m) for m in melds[actor]]
+                    ankans = legal_ankans(hand_mpsz, melds_now)
+                    ankan_tiles = mpsz_list(parsed.hand_tiles)
+                    ankan_tile = ankan_tiles[0] if ankan_tiles else None
+                    rivers_rel, melds_rel = _rel_table_snapshot(rivers, melds, seat)
+                    yield DecisionPoint(
+                        kyoku_index=kyoku_index,
+                        kyoku_meta=list(meta),
+                        seat=seat,
+                        turn=turns[actor],
+                        hand=hand_mpsz,
+                        drawn_tile=tenhou_to_mpsz(last_drawn[actor])
+                        if last_drawn[actor] is not None
+                        else None,
+                        melds=melds_now,
+                        dora_indicators=mpsz_list(doras),
+                        round_wind=round_wind,
+                        seat_wind=seat_wind,
+                        actual_discard=None,
+                        actual_discard_raw=None,
+                        is_riichi_discard=False,
+                        is_tsumogiri=False,
+                        scores=list(scores),
+                        label=f"{label_base} 第{turns[actor]}巡",
+                        rivers=rivers_rel,
+                        melds_by_rel=melds_rel,
+                        discards_log=[dict(x) for x in discards_log],
+                        open_after_seq=_open_after_rel(),
+                        legal_kakans=[]
+                        if self_riichi
+                        else legal_kakans(hand_mpsz, melds_now),
+                        actual_kakan=None,
+                        legal_ankans=ankans,
+                        actual_ankan=ankan_tile,
+                        is_riichi_post=self_riichi,
+                    )
                 _remove_tiles(hands[actor], parsed.hand_tiles)
                 melds[actor].append(_meld_to_api(parsed, None))
             elif parsed.type == "kakan":
+                # 实加杠前产出决策点（对照切牌/加杠）
+                if actor == seat and not self_riichi:
+                    hand_now = _hand_list(hands[actor])
+                    hand_mpsz = sort_hand_mpsz(mpsz_list(hand_now))
+                    melds_now = [dict(m) for m in melds[actor]]
+                    kakans = legal_kakans(hand_mpsz, melds_now)
+                    kakan_tile = (
+                        tenhou_to_mpsz(parsed.hand_tiles[0])
+                        if parsed.hand_tiles
+                        else tenhou_to_mpsz(parsed.called)
+                        if parsed.called is not None
+                        else None
+                    )
+                    rivers_rel, melds_rel = _rel_table_snapshot(rivers, melds, seat)
+                    yield DecisionPoint(
+                        kyoku_index=kyoku_index,
+                        kyoku_meta=list(meta),
+                        seat=seat,
+                        turn=turns[actor],
+                        hand=hand_mpsz,
+                        drawn_tile=tenhou_to_mpsz(last_drawn[actor])
+                        if last_drawn[actor] is not None
+                        else None,
+                        melds=melds_now,
+                        dora_indicators=mpsz_list(doras),
+                        round_wind=round_wind,
+                        seat_wind=seat_wind,
+                        actual_discard=None,
+                        actual_discard_raw=None,
+                        is_riichi_discard=False,
+                        is_tsumogiri=False,
+                        scores=list(scores),
+                        label=f"{label_base} 第{turns[actor]}巡",
+                        rivers=rivers_rel,
+                        melds_by_rel=melds_rel,
+                        discards_log=[dict(x) for x in discards_log],
+                        open_after_seq=_open_after_rel(),
+                        legal_kakans=kakans,
+                        actual_kakan=kakan_tile,
+                        legal_ankans=legal_ankans(hand_mpsz, melds_now),
+                        actual_ankan=None,
+                        is_riichi_post=False,
+                    )
                 _remove_tiles(hands[actor], parsed.hand_tiles)
                 upgraded = False
                 for m in melds[actor]:
@@ -549,35 +642,73 @@ def iter_seat_decisions(
         )
 
         if actor == seat:
-            if self_riichi:
-                # 立直后的强制摸切巡：不产出决策点，本局检讨到此截断
-                break
             hand_now = _hand_list(hands[actor])
+            hand_mpsz = sort_hand_mpsz(mpsz_list(hand_now))
+            melds_now = [dict(m) for m in melds[actor]]
             rivers_rel, melds_rel = _rel_table_snapshot(rivers, melds, seat)
-            yield DecisionPoint(
-                kyoku_index=kyoku_index,
-                kyoku_meta=list(meta),
-                seat=seat,
-                turn=turns[actor],
-                hand=sort_hand_mpsz(mpsz_list(hand_now)),
-                drawn_tile=tenhou_to_mpsz(last_drawn[actor])
-                if last_drawn[actor] is not None
-                else None,
-                melds=[dict(m) for m in melds[actor]],
-                dora_indicators=mpsz_list(doras),
-                round_wind=round_wind,
-                seat_wind=seat_wind,
-                actual_discard=tenhou_to_mpsz(disc_tile),
-                actual_discard_raw=disc_tok,
-                is_riichi_discard=is_riichi,
-                is_tsumogiri=is_tsumogiri,
-                scores=list(scores),
-                label=f"{label_base} 第{turns[actor]}巡",
-                rivers=rivers_rel,
-                melds_by_rel=melds_rel,
-                discards_log=[dict(x) for x in discards_log],
-                open_after_seq=_open_after_rel(),
-            )
+            if self_riichi:
+                # 立直后：仅可暗杠窗口产决策点；普通摸切不检讨
+                ankans = legal_ankans(hand_mpsz, melds_now)
+                if ankans:
+                    yield DecisionPoint(
+                        kyoku_index=kyoku_index,
+                        kyoku_meta=list(meta),
+                        seat=seat,
+                        turn=turns[actor],
+                        hand=hand_mpsz,
+                        drawn_tile=tenhou_to_mpsz(last_drawn[actor])
+                        if last_drawn[actor] is not None
+                        else None,
+                        melds=melds_now,
+                        dora_indicators=mpsz_list(doras),
+                        round_wind=round_wind,
+                        seat_wind=seat_wind,
+                        actual_discard=tenhou_to_mpsz(disc_tile),
+                        actual_discard_raw=disc_tok,
+                        is_riichi_discard=False,
+                        is_tsumogiri=is_tsumogiri,
+                        scores=list(scores),
+                        label=f"{label_base} 第{turns[actor]}巡",
+                        rivers=rivers_rel,
+                        melds_by_rel=melds_rel,
+                        discards_log=[dict(x) for x in discards_log],
+                        open_after_seq=_open_after_rel(),
+                        legal_kakans=[],
+                        actual_kakan=None,
+                        legal_ankans=ankans,
+                        actual_ankan=None,
+                        is_riichi_post=True,
+                    )
+            else:
+                yield DecisionPoint(
+                    kyoku_index=kyoku_index,
+                    kyoku_meta=list(meta),
+                    seat=seat,
+                    turn=turns[actor],
+                    hand=hand_mpsz,
+                    drawn_tile=tenhou_to_mpsz(last_drawn[actor])
+                    if last_drawn[actor] is not None
+                    else None,
+                    melds=melds_now,
+                    dora_indicators=mpsz_list(doras),
+                    round_wind=round_wind,
+                    seat_wind=seat_wind,
+                    actual_discard=tenhou_to_mpsz(disc_tile),
+                    actual_discard_raw=disc_tok,
+                    is_riichi_discard=is_riichi,
+                    is_tsumogiri=is_tsumogiri,
+                    scores=list(scores),
+                    label=f"{label_base} 第{turns[actor]}巡",
+                    rivers=rivers_rel,
+                    melds_by_rel=melds_rel,
+                    discards_log=[dict(x) for x in discards_log],
+                    open_after_seq=_open_after_rel(),
+                    legal_kakans=legal_kakans(hand_mpsz, melds_now),
+                    actual_kakan=None,
+                    legal_ankans=legal_ankans(hand_mpsz, melds_now),
+                    actual_ankan=None,
+                    is_riichi_post=False,
+                )
 
         if actor == seat and is_riichi:
             self_riichi = True

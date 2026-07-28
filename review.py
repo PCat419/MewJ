@@ -867,7 +867,11 @@ def _parse_response(
         "enable_shanten_down": bool(server_sd),
         "best": best,
         "actual": dp.actual_discard,
-        "match": best == dp.actual_discard if best else None,
+        "match": (
+            best == dp.actual_discard
+            if best and dp.actual_discard
+            else None
+        ),
         "candidates": ranked,
         "hand": dp.hand,
         "melds": dp.melds,
@@ -1274,7 +1278,11 @@ def _review_paipu_body(
                     "legal_summary": {
                         "pon": len((dp.legal or {}).get("pon") or []),
                         "chii": len((dp.legal or {}).get("chii") or []),
-                        "daiminkan": bool((dp.legal or {}).get("daiminkan")),
+                        "daiminkan": (
+                            len((dp.legal or {}).get("daiminkan") or [])
+                            if isinstance((dp.legal or {}).get("daiminkan"), list)
+                            else int(bool((dp.legal or {}).get("daiminkan")))
+                        ),
                     },
                     "analysis": None,
                     "skipped": False,
@@ -1342,6 +1350,11 @@ def _review_paipu_body(
                         "drawn_tile": dp.drawn_tile,
                         "melds": dp.melds,
                         "actual": dp.actual_discard,
+                        "actual_kakan": getattr(dp, "actual_kakan", None),
+                        "legal_kakans": list(getattr(dp, "legal_kakans", None) or []),
+                        "actual_ankan": getattr(dp, "actual_ankan", None),
+                        "legal_ankans": list(getattr(dp, "legal_ankans", None) or []),
+                        "is_riichi_post": bool(getattr(dp, "is_riichi_post", False)),
                         "is_riichi": dp.is_riichi_discard,
                         "is_tsumogiri": dp.is_tsumogiri,
                         "analysis": None,
@@ -1361,6 +1374,11 @@ def _review_paipu_body(
                 "round_wind": dp.round_wind,
                 "seat_wind": dp.seat_wind,
                 "actual": dp.actual_discard,
+                "actual_kakan": getattr(dp, "actual_kakan", None),
+                "legal_kakans": list(getattr(dp, "legal_kakans", None) or []),
+                "actual_ankan": getattr(dp, "actual_ankan", None),
+                "legal_ankans": list(getattr(dp, "legal_ankans", None) or []),
+                "is_riichi_post": bool(getattr(dp, "is_riichi_post", False)),
                 "is_riichi": dp.is_riichi_discard,
                 "is_tsumogiri": dp.is_tsumogiri,
                 "analysis": None,
@@ -1374,25 +1392,88 @@ def _review_paipu_body(
                     ana = analyze_decision_resilient(dp, nanikiru_url=nanikiru_url)
                 entry["analysis"] = ana
                 if ana.get("ok"):
+                    # 立直后暗杠卡：切牌侧只保留摸切 drawn 作对照
+                    if getattr(dp, "is_riichi_post", False):
+                        drawn = dp.drawn_tile
+                        if drawn:
+                            from .call_eval import _norm_kind as _nk
+
+                            want = _nk(str(drawn))
+                            filtered = [
+                                c
+                                for c in (ana.get("candidates") or [])
+                                if _nk(str(c.get("tile") or "")) == want
+                            ]
+                            if filtered:
+                                ana["candidates"] = filtered
+                                ana["best"] = filtered[0].get("tile")
                     posture = advance(posture, evaluate_posture(ana))
                     posture = apply_posture(ana, posture)
+                    need_kan_def = (
+                        getattr(dp, "legal_kakans", None)
+                        or getattr(dp, "actual_kakan", None)
+                        or getattr(dp, "legal_ankans", None)
+                        or getattr(dp, "actual_ankan", None)
+                    )
+                    kan_def = None
+                    if need_kan_def:
+                        from . import call_eval as _ce
+
+                        try:
+                            kan_def = compute_defense(dp)
+                        except Exception:
+                            kan_def = None
+                        # 加杠：与切牌候选合并权重（须在姿态门控之后）
+                        if getattr(dp, "legal_kakans", None) or getattr(
+                            dp, "actual_kakan", None
+                        ):
+                            _ce.attach_kakan_to_analysis(
+                                dp,
+                                ana,
+                                nanikiru_url,
+                                defense=kan_def,
+                                workers=n_workers,
+                            )
+                        # 暗杠：与切/加杠合并（须在加杠之后以统一 softmax）
+                        if getattr(dp, "legal_ankans", None) or getattr(
+                            dp, "actual_ankan", None
+                        ):
+                            _ce.attach_ankan_to_analysis(
+                                dp,
+                                ana,
+                                nanikiru_url,
+                                defense=kan_def,
+                                workers=n_workers,
+                            )
                     # 先制立直判断（附加轴）：0 向听时切牌表含立直权重
+                    # 立直后暗杠卡 / 实暗杠巡不走立直覆盖
                     from . import riichi_eval
 
-                    rd = riichi_eval.evaluate_declare(dp, ana, posture=posture)
-                    ana["riichi_declare"] = rd
-                    # 立直线一致/不一致覆盖切牌卡判定：
-                    # - 都立直 → 本巡一致（切哪张交给后续立直卡）
-                    # - 立/默分歧 → 本巡不一致（覆盖切牌「尚可」）
-                    if (
-                        rd.get("recommend") == "riichi"
-                        and bool(dp.is_riichi_discard)
+                    if getattr(dp, "is_riichi_post", False) or getattr(
+                        dp, "actual_ankan", None
                     ):
-                        ana["match"] = True
-                        ana["match_kind"] = "same"
-                    elif rd.get("match") is False:
-                        ana["match"] = False
-                        ana["match_kind"] = "different"
+                        ana["riichi_declare"] = {
+                            "ok": True,
+                            "skipped": True,
+                            "reason": "ankan_window",
+                        }
+                    else:
+                        rd = riichi_eval.evaluate_declare(dp, ana, posture=posture)
+                        ana["riichi_declare"] = rd
+                        # 立直线一致/不一致覆盖切牌卡判定：
+                        # - 都立直 → 本巡一致（切哪张交给后续立直卡）
+                        # - 立/默分歧 → 本巡不一致（覆盖切牌「尚可」）
+                        # 实加杠巡不走立直覆盖
+                        if not getattr(dp, "actual_kakan", None):
+                            if (
+                                rd.get("recommend") == "riichi"
+                                and bool(dp.is_riichi_discard)
+                            ):
+                                ana["match"] = True
+                                ana["match_kind"] = "same"
+                            elif rd.get("match") is False:
+                                ana["match"] = False
+                                ana["match_kind"] = "different"
             except Exception as exc:
                 entry["analysis"] = {"ok": False, "error": str(exc)}
             decisions_out.append(entry)

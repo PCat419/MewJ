@@ -137,9 +137,9 @@ def _hand_span(tiles, tile_base: str, drawn_tile: Optional[str] = None) -> str:
 _MELD_TYPE_ZH = {
     "chii": "吃",
     "pon": "碰",
-    "daiminkan": "大明杠",
-    "ankan": "暗杠",
-    "kakan": "加杠",
+    "daiminkan": "杠",
+    "ankan": "杠",
+    "kakan": "杠",
 }
 
 
@@ -240,7 +240,14 @@ def _uke_cell(c: dict, tile_base: str) -> str:
     )
 
 
-_ACTION_ZH = {"pon": "碰", "chii": "吃", "daiminkan": "大明杠", "skip": "跳过"}
+_ACTION_ZH = {
+    "pon": "碰",
+    "chii": "吃",
+    "daiminkan": "杠",
+    "ankan": "杠",
+    "kakan": "杠",
+    "skip": "跳过",
+}
 
 
 def _fmt_win(value) -> str:
@@ -425,7 +432,7 @@ def _riichi_cut_turn_html(d: dict, ky: dict, tile_base: str, seq: int):
 
 
 def _call_turn_html(d: dict, ky: dict, tile_base: str, seq: int):
-    """副露决策点卡片：碰/吃 vs 跳过的反事实对比表。"""
+    """副露决策点卡片：碰/吃/大明杠 vs 跳过的反事实对比表。"""
     analysis = d.get("analysis") or {}
     actual = d.get("actual")
     match = analysis.get("match")
@@ -469,7 +476,8 @@ def _call_turn_html(d: dict, ky: dict, tile_base: str, seq: int):
 
     # 对比表：跳过期望行 + 各副露变体行，按推荐权重降序
     # （推荐高亮、玩家标记、自杀层淡色；消耗牌图并入选项列。
-    #  不展示「切」——副露后怎么切交给随后的切牌决策卡。）
+    #  不展示「切」——副露后怎么切交给随后的切牌决策卡。
+    #  不展示依据文案。）
     detail = ""
     if analysis.get("ok"):
         head = (
@@ -506,7 +514,9 @@ def _call_turn_html(d: dict, ky: dict, tile_base: str, seq: int):
                 )
             ):
                 mark += " best"
-            is_actual_row = actual in ("pon", "chii") and v.get("action") == actual
+            is_actual_row = (
+                actual in ("pon", "chii", "daiminkan") and v.get("action") == actual
+            )
             if is_actual_row:
                 mark += " actual"
             action_zh = _ACTION_ZH.get(v.get("action"), v.get("action"))
@@ -540,10 +550,6 @@ def _call_turn_html(d: dict, ky: dict, tile_base: str, seq: int):
                       <thead><tr>{head}</tr></thead>
                       <tbody>{body}</tbody>
                     </table></div>"""
-        # 判定依据（速度轴/收益轴/形听轴的中文 basis 文案由 decide 生成）
-        basis = str(analysis.get("basis") or "")
-        if basis:
-            detail += f"<div class='muted call-basis'>依据：{_esc(basis)}</div>"
     elif analysis.get("error") or (analysis and analysis.get("ok") is False):
         detail = (
             f"<div class='err'>{_esc(analysis.get('error') or '评估失败')}</div>"
@@ -671,19 +677,24 @@ def render_classic_html(report: dict, tile_base: str = "../assets/tiles") -> str
             else:
                 # 候选按推荐权重降序渲染（权重=综合效用 softmax，与推荐徽标口径一致；
                 # 无权重时保持原顺序，即向听数→牌效EV）
+                kakan_opts = list(analysis.get("kakan_options") or [])
+                ankan_opts = list(analysis.get("ankan_options") or [])
+                has_kan = bool(kakan_opts) or bool(ankan_opts)
+                rec_action = analysis.get("recommend_action") or "discard"
+                best_kakan = analysis.get("best_kakan")
+                best_ankan = analysis.get("best_ankan")
+                actual_kakan = d.get("actual_kakan")
+                actual_ankan = d.get("actual_ankan")
+
+                _rows = []  # (weight, html)
                 _cands = list(analysis.get("candidates") or [])
-                if any(c.get("recommendation_weight") is not None for c in _cands):
-                    _cands.sort(
-                        key=lambda c: c.get("recommendation_weight")
-                        if c.get("recommendation_weight") is not None
-                        else -1.0,
-                        reverse=True,
-                    )
                 for c in _cands:
                     mark = ""
-                    if c.get("tile") == actual:
+                    if actual_kakan or actual_ankan:
+                        pass
+                    elif c.get("tile") == actual:
                         mark += " actual"
-                    if c.get("tile") == best:
+                    if rec_action not in ("kakan", "ankan") and c.get("tile") == best:
                         mark += " best"
                     if c.get("policy_rejected") or c.get("kuikae"):
                         mark += " rejected"
@@ -705,13 +716,103 @@ def render_classic_html(report: dict, tile_base: str = "../assets/tiles") -> str
                         f"<td class='weight'>"
                         f"{_fmt_weight(c.get('recommendation_weight'))}</td>"
                     )
-                    cand_rows += (
-                        f"<tr class='{mark}'>"
-                        f"<td>{_tile_img(c.get('tile'), tile_base)}{kuikae_badge}</td>"
-                        f"<td>{_esc(c.get('shanten'))}</td>"
-                        f"{uke_cell}{exp_cell}{deal_cell}{utility_cell}{weight_cell}"
-                        f"</tr>"
+                    label_cell = (
+                        f"{_tile_img(c.get('tile'), tile_base)}{kuikae_badge}"
                     )
+                    _rows.append(
+                        (
+                            c.get("recommendation_weight"),
+                            f"<tr class='{mark.strip()}'>"
+                            f"<td>{label_cell}</td>"
+                            f"<td>{_esc(c.get('shanten'))}</td>"
+                            f"{uke_cell}{exp_cell}{deal_cell}{utility_cell}{weight_cell}"
+                            f"</tr>",
+                        )
+                    )
+
+                def _kan_row(o: dict, *, is_ankan: bool) -> None:
+                    mark = ""
+                    tile = o.get("tile")
+                    tiles = o.get("tiles") or ([tile] if tile else [])
+                    kind_o = str(o.get("kind") or "")
+                    if is_ankan:
+                        ak = str(actual_ankan or "")
+                        kind_a = (
+                            ("5" + ak[1:]) if ak.startswith("0") else ak
+                        )
+                        if ak and (
+                            str(tile) == ak
+                            or (kind_o and kind_o == kind_a)
+                        ):
+                            mark += " actual"
+                        bk = str(best_ankan or "")
+                        kind_b = str(analysis.get("best_ankan_kind") or "")
+                        if rec_action == "ankan" and (
+                            (bk and str(tile) == bk)
+                            or (kind_b and kind_o == kind_b)
+                        ):
+                            mark += " best"
+                    else:
+                        if actual_kakan and str(tile) == str(
+                            d.get("actual_kakan") or actual
+                        ):
+                            mark += " actual"
+                        if rec_action == "kakan" and str(tile) == str(
+                            best_kakan or ""
+                        ):
+                            mark += " best"
+                    if o.get("rejected") or o.get("hard_block"):
+                        mark += " rejected"
+                    exp_cell = (
+                        "<td class='na'>—</td>"
+                        if show_uke_only or o.get("ev") is None
+                        else f"<td>{_fmt_score(o.get('ev'))}</td>"
+                    )
+                    deal = o.get("deal_in") or {}
+                    deal_cell = _deal_in_cell(deal.get("combined"))
+                    utility_cell = f"<td>{_fmt_score(o.get('adjusted_utility'))}</td>"
+                    weight_cell = (
+                        f"<td class='weight'>"
+                        f"{_fmt_weight(o.get('recommendation_weight'))}</td>"
+                    )
+                    sh = o.get("cut_shanten")
+                    if sh is None:
+                        sh = o.get("shanten")
+                    if is_ankan and len(tiles) >= 4:
+                        imgs = "".join(_tile_img(t, tile_base) for t in tiles[:4])
+                        label = f"杠 {imgs}"
+                    else:
+                        label = f"杠 {_tile_img(tile, tile_base)}"
+                    _rows.append(
+                        (
+                            o.get("recommendation_weight"),
+                            f"<tr class='{mark.strip()}'>"
+                            f"<td>{label}</td>"
+                            f"<td>{_esc(sh if sh is not None else '—')}</td>"
+                            f"<td class='uke'>—</td>"
+                            f"{exp_cell}{deal_cell}{utility_cell}{weight_cell}"
+                            f"</tr>",
+                        )
+                    )
+
+                for o in kakan_opts:
+                    _kan_row(o, is_ankan=False)
+                for o in ankan_opts:
+                    _kan_row(o, is_ankan=True)
+                if any(w is not None for w, _ in _rows):
+                    _rows.sort(
+                        key=lambda rw: -(
+                            float(rw[0]) if rw[0] is not None else -1.0
+                        )
+                    )
+                cand_rows = "".join(html for _, html in _rows)
+                # stash for head / chips
+                d["_has_kakan_rows"] = has_kan
+                d["_rec_action"] = rec_action
+                d["_best_kakan"] = best_kakan
+                d["_best_ankan"] = best_ankan
+                d["_actual_kakan"] = d.get("actual_kakan")
+                d["_actual_ankan"] = d.get("actual_ankan")
 
             detail = ""
             if cand_rows or analysis.get("defense") or analysis.get("defense_error"):
@@ -720,8 +821,8 @@ def render_classic_html(report: dict, tile_base: str = "../assets/tiles") -> str
                     "<th>综合危险度</th><th>综合效用</th><th>推荐权重</th>"
                 )
                 if cand_rows:
-                    # 含立直元动作时首列标题改为「选项」
-                    if rd_active:
+                    # 含立直元动作或加杠时首列标题改为「选项」
+                    if rd_active or d.get("_has_kakan_rows"):
                         head = (
                             "<th>选项</th><th>向听数</th><th>进张</th><th>牌效EV</th>"
                             "<th>综合危险度</th><th>综合效用</th><th>推荐权重</th>"
@@ -765,16 +866,46 @@ def render_classic_html(report: dict, tile_base: str = "../assets/tiles") -> str
                         recommend = (
                             f'<span class="rec">推荐：{_tile_img(dt, tile_base)}</span>'
                         )
+            elif (analysis.get("recommend_action") == "ankan") or (
+                d.get("_rec_action") == "ankan"
+            ):
+                at = analysis.get("best_ankan") or d.get("_best_ankan")
+                recommend = (
+                    f'<span class="rec">推荐：杠 {_tile_img(at, tile_base)}</span>'
+                    if at
+                    else '<span class="rec">推荐：杠</span>'
+                )
+            elif (analysis.get("recommend_action") == "kakan") or (
+                d.get("_rec_action") == "kakan"
+            ):
+                kt = analysis.get("best_kakan") or d.get("_best_kakan")
+                recommend = (
+                    f'<span class="rec">推荐：杠 {_tile_img(kt, tile_base)}</span>'
+                    if kt
+                    else '<span class="rec">推荐：杠</span>'
+                )
             elif best:
                 recommend = f'<span class="rec">推荐：{_tile_img(best, tile_base)}</span>'
 
             # 立直判断巡：玩家侧只标「立直」，不重复显示切牌（切牌交给后续立直卡）
             if d.get("is_riichi"):
                 player_chip = '<span class="meta-item">玩家：立直</span>'
-            else:
+            elif d.get("actual_ankan"):
+                player_chip = (
+                    f'<span class="meta-item">玩家：杠 '
+                    f'{_tile_img(d.get("actual_ankan"), tile_base)}</span>'
+                )
+            elif d.get("actual_kakan"):
+                player_chip = (
+                    f'<span class="meta-item">玩家：杠 '
+                    f'{_tile_img(d.get("actual_kakan"), tile_base)}</span>'
+                )
+            elif actual:
                 player_chip = (
                     f'<span class="meta-item">玩家：{_tile_img(actual, tile_base)}</span>'
                 )
+            else:
+                player_chip = ""
 
             tid = f"t{ky.get('index')}_{d.get('turn')}"
             short = str(d.get("label") or "").split()[-1] or f"第{d.get('turn')}巡"

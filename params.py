@@ -213,7 +213,7 @@ PARAMS = {
         "chiitoitsu_keep_suji_weight": 0.20,
     },
     # ------------------------------------------------------------------
-    # 副露判断（call_eval.py）：碰/吃 vs 跳过的反事实评估
+    # 副露判断（call_eval.py）：碰/吃/大明杠 vs 跳过的反事实评估
     # ------------------------------------------------------------------
     "call": {
         # 速度轴：副露后和率 − 跳过期望和率 ≥ 该值 → 推荐副露
@@ -234,8 +234,29 @@ PARAMS = {
         # 速度轴合格变体的显示效用差 d = Δ和率 × 该系数（相对跳过基准 0）。
         # 标定依据：T=200 下 Δ和率 0.10~0.23 → 权重 98%~99.99%，与 mortal 置信度同量级
         "win_prob_weight_scale": 8000.0,
-        # v1 不评估大明杠（岭上摸牌期望需另建模型）
-        "eval_daiminkan": False,
+        # 大明杠：岭上摸牌期望（不翻新宝牌）+ 情境偏置；False 时不评估杠变体
+        "eval_daiminkan": True,
+        # 情境倍率（乘到杠侧 Δ和率/ΔEV 合格判定与报告显示效用上）
+        "daiminkan_bias_menzen": 0.05,  # 门清：极低，硬门控不推荐
+        "daiminkan_bias_tenpai_safe": 3.0,  # 非门清·听牌·无他家立直：极高
+        "daiminkan_bias_tenpai_riichi": 0.4,  # 非门清·听牌·有他家立直：较低
+        "daiminkan_bias_noten_riichi": 0.05,  # 非门清·未听·有他家立直：极低，硬门控
+        "daiminkan_bias_default": 1.0,  # 非门清·未听·无立直：中性，靠 EV/跳符
+        # 加杠：挂切牌卡；岭上期望（不翻新宝牌）+ 情境偏置；抢杠简版闸
+        "eval_kakan": True,
+        "kakan_bias_tenpai_safe": 3.0,
+        "kakan_bias_tenpai_riichi": 0.4,
+        "kakan_bias_noten_riichi": 0.05,
+        "kakan_bias_default": 1.0,
+        # 加杠牌综合危险 ≥ 该值 → 抢杠简版硬门控（与形听多威胁 cap 同量级）
+        "kakan_chankan_danger_cap": 0.12,
+        # 暗杠：挂切牌卡；岭上期望（不翻新宝牌）+ 进攻向情境偏置；无门清否决
+        # 立直后/已听牌：待牌集合不变硬闸；役种损失靠 EV 拦
+        "eval_ankan": True,
+        "ankan_bias_tenpai_safe": 3.0,  # 听牌·无他家立直
+        "ankan_bias_tenpai_riichi": 0.4,  # 听牌·有他家立直
+        "ankan_bias_noten_riichi": 0.05,  # 未听·有立直 → 硬门控
+        "ankan_bias_default": 1.0,  # 未听·无立直
         # ---- 形听轴：晚巡 1 向听时允许无役副露（吃/碰）+ 低危切保听避罚符 ----
         # 语境（姿态/巡目/威胁/危险查询）由 review 调用处传入；全弃态轴关闭
         # 启用形听轴的最早巡目（与 posture.keiten_min_turn 同口径，13 巡起）
