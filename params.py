@@ -28,6 +28,8 @@ PARAMS = {
         "furo_alphas": {1: 0.20, 2: 0.40, 3: 0.70, 4: 1.00},
         # 1/2 副露威胁度爬满所需巡目（≥ 该巡取上限）
         "furo_alpha_full_turn": 12,
+        # 无正式威胁时：对三家用听牌形估「潜在危险」（仅供近并列危险牌先打，不进报告）
+        "latent_danger_alpha": 0.35,
     },
     # ------------------------------------------------------------------
     # 危险度信号系数（defense_heuristics.py，乘算后归一化）
@@ -199,9 +201,33 @@ PARAMS = {
         # 交换率含义：1pp 和率 ≈ win_scale/100 点 EV；高和率能否翻盘取决于 ΔEV 与 Δ和率的相对大小，无绝对 EV 门槛。
         "near_tie_win_scale": 1000.0,
         "near_tie_tenpai_scale": 200.0,
-        # 高向听烂牌的役牌单张保有补正：δ=(向听−2)×base×活牌比例（≥该向听才补）
+        # 高向听烂牌的役牌单张保有补正：只给「最该留的 1 张未损役」补
+        # 摸对/碰役期权；δ=(向听−2)×base×活牌比例（≥该向听才考虑）。
+        # max_tiles=1 避免多浮役被一起护成字牌仓库；overturn_cap / soft_eps
+        # 限制为近并列轻推，禁止大翻盘。
         "yakuhai_keep_base": 60.0,
         "yakuhai_keep_min_shanten": 4,
+        "yakuhai_keep_max_tiles": 1,
+        "yakuhai_keep_overturn_cap": 40.0,
+        "yakuhai_keep_soft_eps": 2.0,
+        # 多张浮字切牌阶梯（候选间相对重排）：
+        # 损2任意 ＜ 客风 ＜ 损1役牌 ＜ 未损役牌；档差 step 点。
+        # 同档：自风略更留；东/南场非自家时场风微弱先打（防他家碰）。
+        "honor_ladder_step": 25.0,
+        "honor_ladder_seat_bonus": 12.0,
+        "honor_ladder_round_antipon": 6.0,
+        # 幺九 vs 未损役：offense 很接近时优先切 1/9（不看邻张；124 的 1 同样适用）。
+        # 对「切未损役」扣 bonus；band 宜紧，避免把明显更优的切役扳成切幺九。
+        "terminal_vs_yakuhai_band": 25.0,
+        "terminal_vs_yakuhai_bonus": 40.0,
+        # 无威胁近并列：不影响牌效时优先切潜在更危险的牌（危险牌先打）。
+        # band=相对最优 offense；util += scale × turn_decay × shanten_decay × (danger−min)。
+        # 仅 turn≤max_turn；turn_decay=(max_turn+1−turn)/max_turn。
+        # 仅 1–2 向听（max_shanten=2）：1 向听满额，2 向听 ×0.5；≥3 关闭。
+        "no_threat_danger_first_band": 40.0,
+        "no_threat_danger_first_scale": 2000.0,
+        "no_threat_danger_first_max_turn": 12,
+        "no_threat_danger_first_max_shanten": 2,
         # 直线七对近并列微调：七对≤2 且比一般型少 ≥gap 向、无威胁时，
         # 仅在相对最优 EV 落后 ≤band 的最低向听候选上，用 isolation/tanki/筋
         # 小幅重排；tiebreak_max 须明显小于 band，避免盖过候牌枚数 EV。

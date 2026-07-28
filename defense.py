@@ -22,6 +22,8 @@ from .replay import DecisionPoint
 
 FURO_ALPHAS = PARAMS["defense"]["furo_alphas"]
 FURO_ALPHA_FULL_TURN = PARAMS["defense"]["furo_alpha_full_turn"]
+# 无正式威胁时仍用听牌形估潜在危险（危险牌先打）；等权软或
+LATENT_DANGER_ALPHA = float(PARAMS["defense"].get("latent_danger_alpha", 0.35))
 THREAT_SEATS = ("下家", "对家", "上家")
 _OPEN_TYPES = frozenset({"chii", "pon", "daiminkan", "kakan"})
 ALL_TILES: List[str] = (
@@ -233,6 +235,52 @@ def _alphas(threats: List[Dict[str, Any]], turn: float) -> Dict[str, float]:
     return out
 
 
+def _seat_genbutsu(dp: DecisionPoint, seat: str) -> Set[str]:
+    """该家牌河现物（无威胁潜在危险用）。"""
+    safe: Set[str] = set()
+    for t in (dp.rivers or {}).get(seat) or []:
+        nt = normalize_tile(t)
+        if nt:
+            safe.add(nt)
+    for e in dp.discards_log or []:
+        if e.get("rel") == seat:
+            nt = normalize_tile(e.get("tile") or "")
+            if nt:
+                safe.add(nt)
+    return safe
+
+
+def _latent_danger_no_threat(
+    dp: DecisionPoint,
+    remaining: Dict[str, int],
+    log: List[dict],
+) -> Dict[str, float]:
+    """无立直/副露威胁时，仍用听牌形对三家估相对危险（软或）。
+
+    用于「无威胁 + 近并列 → 危险牌先打」；不进入报告展示。
+    """
+    alpha = min(1.0, max(0.0, LATENT_DANGER_ALPHA))
+    # soft-OR: 1 - Π(1 - α p_seat)
+    survival = {t: 1.0 for t in ALL_TILES}
+    for seat in THREAT_SEATS:
+        gb = _seat_genbutsu(dp, seat)
+        modeled = _wait_shape_risk(gb, remaining, seat, log)
+        probs = modeled.get("probs") or {}
+        try:
+            heuristic = analyze_danger_signals(dp, seat)
+            probs = _apply_tile_factors(
+                probs,
+                heuristic.get("tile_factors") or {},
+                gb,
+            )
+        except Exception:
+            pass
+        for t in ALL_TILES:
+            p = min(1.0, max(0.0, float(probs.get(t) or 0.0)))
+            survival[t] *= 1.0 - alpha * p
+    return {t: 1.0 - survival[t] for t in ALL_TILES}
+
+
 def compute_defense(dp: DecisionPoint) -> Dict[str, Any]:
     """Return per-seat / combined relative danger for all 34 tiles."""
     threats = _collect_threats(dp)
@@ -290,9 +338,11 @@ def compute_defense(dp: DecisionPoint) -> Dict[str, Any]:
 
     alphas = _alphas(threats, turn)
     combined: Dict[str, Optional[float]] = {}
+    latent_combined: Optional[Dict[str, float]] = None
     if not threats:
         for t in ALL_TILES:
             combined[t] = None
+        latent_combined = _latent_danger_no_threat(dp, remaining, log)
     else:
         for t in ALL_TILES:
             prod = 1.0
@@ -309,6 +359,7 @@ def compute_defense(dp: DecisionPoint) -> Dict[str, Any]:
         "per_seat": per_seat,
         "combined": combined,
         "relative_risk": combined,
+        "latent_combined": latent_combined,
         "remaining": remaining,
         "metric": "relative_danger",
         "calibrated": False,

@@ -42,11 +42,26 @@ SEAT_OFFSETS = {"自家": 0, "下家": 1, "对家": 2, "上家": 3}
 WIND_TILES = {"east": "1z", "south": "2z", "west": "3z", "north": "4z"}
 
 # 高向听烂牌（≥4 向听）的役牌单张保有补正：静态表模型纯按进张效率评估，
-# 系统性低估役牌单张「摸对/碰出得役」的翻盘价值。δ = (向听−2)×base × 活牌比例，
-# 活牌 = 3 − 牌河/副露/指示牌中已见枚数（自家持有 ≥2 张时不补）。
-# 仅三元牌/自风/场风等役牌；非役牌字牌不补。
+# 系统性低估役牌单张「摸对/碰出得役」的翻盘价值。只护最该留的 1 张未损役，
+# 且仅在 raw 切役优势不超过 overturn_cap 时轻补（防多浮役仓库化 / 大翻盘）。
 YAKUHAI_KEEP_BASE = _S["yakuhai_keep_base"]
 YAKUHAI_KEEP_MIN_SHANTEN = _S["yakuhai_keep_min_shanten"]
+YAKUHAI_KEEP_MAX_TILES = int(_S.get("yakuhai_keep_max_tiles", 1) or 1)
+YAKUHAI_KEEP_OVERTURN_CAP = _S.get("yakuhai_keep_overturn_cap", 40.0)
+YAKUHAI_KEEP_SOFT_EPS = _S.get("yakuhai_keep_soft_eps", 2.0)
+
+# 切牌阶梯：损2任意 ＜ 客风 ＜ 损1役 ＜ 未损役（字牌候选间相对重排）
+HONOR_LADDER_STEP = _S.get("honor_ladder_step", 25.0)
+HONOR_LADDER_SEAT_BONUS = _S.get("honor_ladder_seat_bonus", 12.0)
+HONOR_LADDER_ROUND_ANTIPON = _S.get("honor_ladder_round_antipon", 6.0)
+# 幺九 vs 未损役近并列：优先切 1/9
+TERMINAL_VS_YAKUHAI_BAND = _S.get("terminal_vs_yakuhai_band", 25.0)
+TERMINAL_VS_YAKUHAI_BONUS = _S.get("terminal_vs_yakuhai_bonus", 40.0)
+NO_THREAT_DANGER_FIRST_BAND = _S.get("no_threat_danger_first_band", 40.0)
+NO_THREAT_DANGER_FIRST_SCALE = _S.get("no_threat_danger_first_scale", 2000.0)
+NO_THREAT_DANGER_FIRST_MAX_TURN = _S.get("no_threat_danger_first_max_turn", 12)
+# 仅 1–2 向听：1 向听满额，2 向听减半；≥3 关闭
+NO_THREAT_DANGER_FIRST_MAX_SHANTEN = _S.get("no_threat_danger_first_max_shanten", 2)
 
 # 同向听：EV 与和率/听牌率按交换率合成进攻效用（无绝对 EV 门槛）
 NEAR_TIE_WIN_SCALE = _S["near_tie_win_scale"]
@@ -83,6 +98,326 @@ def normalize_tile(tile: Any) -> str:
     if value.startswith("0"):
         value = "5" + value[1:]
     return value
+
+
+def _is_honor_tile(tile: str) -> bool:
+    return len(tile) == 2 and tile[1] == "z" and tile[0] in "1234567"
+
+
+def _visible_honor_counts(dp: Any) -> Dict[str, int]:
+    """牌河 / 副露 / 指示牌中已见枚数（不含自家手牌）。"""
+    visible: Dict[str, int] = {}
+
+    def _see(tile: Any) -> None:
+        nt = normalize_tile(tile)
+        if nt:
+            visible[nt] = visible.get(nt, 0) + 1
+
+    for tiles in (getattr(dp, "rivers", None) or {}).values():
+        for t in tiles or []:
+            _see(t)
+    for melds in (getattr(dp, "melds_by_rel", None) or {}).values():
+        for m in melds or []:
+            for t in m.get("tiles") or []:
+                _see(t)
+    for t in getattr(dp, "dora_indicators", None) or []:
+        _see(t)
+    return visible
+
+
+def _own_tile_counts(dp: Any) -> Dict[str, int]:
+    own: Dict[str, int] = {}
+    for t in getattr(dp, "hand", None) or []:
+        nt = normalize_tile(t)
+        if nt:
+            own[nt] = own.get(nt, 0) + 1
+    return own
+
+
+def _yakuhai_tile_set(dp: Any) -> set:
+    tiles = {"5z", "6z", "7z"}
+    for wind in (getattr(dp, "seat_wind", None), getattr(dp, "round_wind", None)):
+        wt = WIND_TILES.get(str(wind or "").lower())
+        if wt:
+            tiles.add(wt)
+    return tiles
+
+
+def _is_terminal_number(tile: str) -> bool:
+    return len(tile) == 2 and tile[1] in "mps" and tile[0] in "19"
+
+
+def honor_keep_score(
+    tile: str,
+    *,
+    visible: Dict[str, int],
+    yakuhai_tiles: set,
+    seat_wind: str,
+    round_wind: str,
+    step: float = HONOR_LADDER_STEP,
+    seat_bonus: float = HONOR_LADDER_SEAT_BONUS,
+    antipon: float = HONOR_LADDER_ROUND_ANTIPON,
+) -> Optional[float]:
+    """字牌保有分：越高越晚切。非字牌返回 None。
+
+    阶梯（先切→晚切）：损2任意 ＜ 客风 ＜ 损1役牌 ＜ 未损役牌。
+    """
+    if not _is_honor_tile(tile):
+        return None
+    step = max(0.0, _as_float(step, HONOR_LADDER_STEP))
+    dmg = max(0, int(visible.get(tile, 0) or 0))
+    is_yakuhai = tile in yakuhai_tiles
+    seat_tile = WIND_TILES.get(str(seat_wind or "").lower())
+    round_tile = WIND_TILES.get(str(round_wind or "").lower())
+    is_guest = tile[0] in "1234" and not is_yakuhai
+
+    if dmg >= 2:
+        tier = 0.0
+    elif is_guest:
+        tier = 1.0
+        # 同档客风：损1 略先于未损
+        tier -= 0.25 * min(dmg, 1)
+    elif is_yakuhai and dmg >= 1:
+        tier = 2.0
+    elif is_yakuhai:
+        tier = 3.0
+    else:
+        tier = 1.0
+
+    score = tier * step
+    if is_yakuhai and seat_tile and tile == seat_tile:
+        score += max(0.0, _as_float(seat_bonus, HONOR_LADDER_SEAT_BONUS))
+    # 东/南场非自家时，场风相对其它役牌微弱先打（防主场家碰）
+    if (
+        round_tile
+        and tile == round_tile
+        and seat_tile != round_tile
+        and str(round_wind or "").lower() in ("east", "south")
+    ):
+        score -= max(0.0, _as_float(antipon, HONOR_LADDER_ROUND_ANTIPON))
+    return score
+
+
+def build_honor_ladder_penalties(
+    candidates: List[Dict[str, Any]],
+    dp: Any,
+    *,
+    visible: Optional[Dict[str, int]] = None,
+) -> Dict[str, float]:
+    """≥2 张字牌候选时，相对保有分转为切牌惩罚（最低档为 0）。"""
+    visible = visible if visible is not None else _visible_honor_counts(dp)
+    yakuhai_tiles = _yakuhai_tile_set(dp)
+    seat_wind = str(getattr(dp, "seat_wind", "") or "")
+    round_wind = str(getattr(dp, "round_wind", "") or "")
+
+    keeps: Dict[str, float] = {}
+    for c in candidates:
+        tile = normalize_tile(c.get("tile"))
+        score = honor_keep_score(
+            tile,
+            visible=visible,
+            yakuhai_tiles=yakuhai_tiles,
+            seat_wind=seat_wind,
+            round_wind=round_wind,
+        )
+        if score is not None:
+            keeps[tile] = score
+    if len(keeps) < 2:
+        return {}
+    floor = min(keeps.values())
+    return {t: max(0.0, k - floor) for t, k in keeps.items()}
+
+
+def build_terminal_vs_yakuhai_penalties(
+    candidates: List[Dict[str, Any]],
+    offenses: List[float],
+    dp: Any,
+    *,
+    visible: Optional[Dict[str, int]] = None,
+) -> Dict[str, float]:
+    """offense 接近时，对「切未损役」扣分，使切 1/9 相对更优（不看邻张）。"""
+    if not candidates or len(candidates) != len(offenses):
+        return {}
+    band = max(0.0, _as_float(TERMINAL_VS_YAKUHAI_BAND, 25.0))
+    bonus = max(0.0, _as_float(TERMINAL_VS_YAKUHAI_BONUS, 40.0))
+    if band <= 0 or bonus <= 0:
+        return {}
+
+    visible = visible if visible is not None else _visible_honor_counts(dp)
+    yakuhai_tiles = _yakuhai_tile_set(dp)
+
+    offense_by_tile: Dict[str, float] = {}
+    for c, off in zip(candidates, offenses):
+        tile = normalize_tile(c.get("tile"))
+        if not tile:
+            continue
+        prev = offense_by_tile.get(tile)
+        offense_by_tile[tile] = off if prev is None else max(prev, off)
+
+    terminals = [t for t in offense_by_tile if _is_terminal_number(t)]
+    fresh_yakuhai = [
+        t
+        for t in offense_by_tile
+        if t in yakuhai_tiles and int(visible.get(t, 0) or 0) == 0
+    ]
+    if not terminals or not fresh_yakuhai:
+        return {}
+
+    out: Dict[str, float] = {}
+    for y in fresh_yakuhai:
+        oy = offense_by_tile[y]
+        if any(abs(oy - offense_by_tile[t]) <= band for t in terminals):
+            out[y] = bonus
+    return out
+
+
+def build_no_threat_danger_first_bonuses(
+    candidates: List[Dict[str, Any]],
+    offenses: List[float],
+    defense: Optional[Dict[str, Any]],
+    *,
+    turn: Any = None,
+    min_shanten: Any = None,
+) -> Dict[str, float]:
+    """无威胁且 offense 接近最优时：切更危险的牌加分（危险牌先打）。
+
+    仅前 max_turn 巡，且仅 1–2 向听：
+    - turn_decay = (max_turn + 1 − turn) / max_turn
+    - shanten_decay：1 向听=1.0，2 向听=0.5；≥3 或听牌关闭
+    危险度取 defense['latent_combined']（听牌形潜在危险，不进报告）。
+    返回值加到 utility 上；安全牌加分为 0。
+    """
+    defense = defense or {}
+    if defense.get("has_threat"):
+        return {}
+    max_turn = max(0, int(NO_THREAT_DANGER_FIRST_MAX_TURN or 0))
+    max_sh = max(0, int(NO_THREAT_DANGER_FIRST_MAX_SHANTEN or 0))
+    if max_turn <= 0 or max_sh <= 0:
+        return {}
+    try:
+        turn_i = int(turn or 0)
+    except (TypeError, ValueError):
+        turn_i = 0
+    if turn_i <= 0 or turn_i > max_turn:
+        return {}
+    try:
+        sh_i = int(min_shanten) if min_shanten is not None else -1
+    except (TypeError, ValueError):
+        sh_i = -1
+    # 仅 1..max_sh（默认 2）；听牌(0)与 ≥3 关闭
+    if sh_i < 1 or sh_i > max_sh:
+        return {}
+    # 1 向听满额 → max_sh 向听剩 1/max_sh
+    shanten_decay = (max_sh + 1 - sh_i) / float(max_sh)
+    # 第1巡满额 → 第 max_turn 巡剩 1/max_turn
+    turn_decay = (max_turn + 1 - turn_i) / float(max_turn)
+    decay = turn_decay * shanten_decay
+    danger = defense.get("latent_combined") or {}
+    if not danger or not candidates or len(candidates) != len(offenses):
+        return {}
+    band = max(0.0, _as_float(NO_THREAT_DANGER_FIRST_BAND, 40.0))
+    scale = max(0.0, _as_float(NO_THREAT_DANGER_FIRST_SCALE, 2000.0))
+    if band <= 0 or scale <= 0 or decay <= 0:
+        return {}
+
+    best_off = max(offenses)
+    near: List[tuple] = []
+    for c, off in zip(candidates, offenses):
+        if abs(float(off) - float(best_off)) > band:
+            continue
+        tile = normalize_tile(c.get("tile"))
+        if not tile:
+            continue
+        near.append((tile, float(danger.get(tile) or 0.0)))
+    if len(near) < 2:
+        return {}
+    min_d = min(d for _, d in near)
+    max_d = max(d for _, d in near)
+    if max_d - min_d <= 1e-12:
+        return {}
+    eff = scale * decay
+    return {tile: eff * (d - min_d) for tile, d in near}
+
+
+def build_yakuhai_keep_penalties(
+    candidates: List[Dict[str, Any]],
+    offenses: List[float],
+    dp: Any,
+    *,
+    min_shanten: int,
+    visible: Optional[Dict[str, int]] = None,
+) -> Dict[str, float]:
+    """最多护 1 张未损役；仅 raw 切役优势落在 overturn_cap 内时轻补。"""
+    if min_shanten < YAKUHAI_KEEP_MIN_SHANTEN or not candidates:
+        return {}
+    if len(candidates) != len(offenses):
+        return {}
+
+    visible = visible if visible is not None else _visible_honor_counts(dp)
+    own = _own_tile_counts(dp)
+    yakuhai_tiles = _yakuhai_tile_set(dp)
+    seat_wind = str(getattr(dp, "seat_wind", "") or "")
+    round_wind = str(getattr(dp, "round_wind", "") or "")
+    max_tiles = max(0, int(YAKUHAI_KEEP_MAX_TILES or 0))
+    if max_tiles <= 0:
+        return {}
+
+    # 仅未损（可见 0）单张役牌；按保有分选最该留的若干张
+    fresh: List[tuple] = []
+    for t in yakuhai_tiles:
+        if own.get(t, 0) != 1:
+            continue
+        if int(visible.get(t, 0) or 0) != 0:
+            continue
+        live = max(0, 3 - int(visible.get(t, 0) or 0))
+        if live <= 0:
+            continue
+        keep = honor_keep_score(
+            t,
+            visible=visible,
+            yakuhai_tiles=yakuhai_tiles,
+            seat_wind=seat_wind,
+            round_wind=round_wind,
+        )
+        fresh.append((float(keep or 0.0), live, t))
+    if not fresh:
+        return {}
+    fresh.sort(key=lambda x: (-x[0], -x[1], x[2]))
+    protected = [t for _, _, t in fresh[:max_tiles]]
+
+    offense_by_tile: Dict[str, float] = {}
+    for c, off in zip(candidates, offenses):
+        tile = normalize_tile(c.get("tile"))
+        if tile:
+            # 同种多候选时取较高 offense（通常唯一）
+            prev = offense_by_tile.get(tile)
+            offense_by_tile[tile] = off if prev is None else max(prev, off)
+
+    base = (min_shanten - 2) * YAKUHAI_KEEP_BASE
+    cap = max(0.0, _as_float(YAKUHAI_KEEP_OVERTURN_CAP, 40.0))
+    soft_eps = max(0.0, _as_float(YAKUHAI_KEEP_SOFT_EPS, 2.0))
+    out: Dict[str, float] = {}
+    for t in protected:
+        off_y = offense_by_tile.get(t)
+        if off_y is None:
+            continue
+        best_other = None
+        for tile, off in offense_by_tile.items():
+            if tile == t:
+                continue
+            if best_other is None or off > best_other:
+                best_other = off
+        if best_other is None:
+            continue
+        gap = float(off_y) - float(best_other)
+        if gap <= 0:
+            continue
+        if gap > cap:
+            continue
+        live = max(0, 3 - int(visible.get(t, 0) or 0))
+        full = base * live / 3.0
+        out[t] = min(full, gap + soft_eps)
+    return out
 
 
 def absolute_wind(self_wind: str, relative_seat: str) -> str:
@@ -531,44 +866,10 @@ def score_candidates(
     if any(_hard(t) for t in threats):
         risk_scale = max(risk_scale, 1.0)
 
-    # ---- 役牌单张保有补正（仅 ≥4 向听烂牌）----
-    yakuhai_keep: Dict[str, float] = {}
     min_shanten = min(
         (_as_int(c.get("shanten"), 99) for c in candidates), default=99
     )
-    if min_shanten >= YAKUHAI_KEEP_MIN_SHANTEN:
-        yakuhai_tiles = {"5z", "6z", "7z"}
-        for wind in (getattr(dp, "seat_wind", None), getattr(dp, "round_wind", None)):
-            wt = WIND_TILES.get(str(wind or "").lower())
-            if wt:
-                yakuhai_tiles.add(wt)
-        visible: Dict[str, int] = {}
-
-        def _see(tile: Any) -> None:
-            nt = normalize_tile(tile)
-            if nt:
-                visible[nt] = visible.get(nt, 0) + 1
-
-        for tiles in (getattr(dp, "rivers", None) or {}).values():
-            for t in tiles or []:
-                _see(t)
-        for melds in (getattr(dp, "melds_by_rel", None) or {}).values():
-            for m in melds or []:
-                for t in (m.get("tiles") or []):
-                    _see(t)
-        for t in (getattr(dp, "dora_indicators", None) or []):
-            _see(t)
-        own: Dict[str, int] = {}
-        for t in (getattr(dp, "hand", None) or []):
-            nt = normalize_tile(t)
-            if nt:
-                own[nt] = own.get(nt, 0) + 1
-        base = (min_shanten - 2) * YAKUHAI_KEEP_BASE
-        for t in yakuhai_tiles:
-            if own.get(t, 0) == 1:
-                live = max(0, 3 - visible.get(t, 0))
-                if live > 0:
-                    yakuhai_keep[t] = base * live / 3.0
+    visible_honors = _visible_honor_counts(dp)
 
     # ---- 荒牌流局罚符期望（noten.py）：exp_score 缺口的补正 ----
     # 预打包每个决策点只算一次的部分（罚符期望/流局率/推进者数）
@@ -590,6 +891,31 @@ def score_candidates(
             base_offenses.append(offense_utility(candidate))
     offenses = apply_near_tie_win_break(
         candidates, base_offenses, group_fallback=group_fallback
+    )
+
+    # 切牌阶梯：≥2 张字牌候选时相对重排（损2＜客风＜损1役＜未损役）
+    honor_ladder = build_honor_ladder_penalties(
+        candidates, dp, visible=visible_honors
+    )
+    # 役牌保有：最多 1 张未损役，且仅近并列低估时轻补
+    yakuhai_keep = build_yakuhai_keep_penalties(
+        candidates,
+        offenses,
+        dp,
+        min_shanten=min_shanten,
+        visible=visible_honors,
+    )
+    # 幺九 vs 未损役：offense 接近时优先切 1/9（扣切役）
+    terminal_vs_yak = build_terminal_vs_yakuhai_penalties(
+        candidates, offenses, dp, visible=visible_honors
+    )
+    # 无威胁近并列：危险牌先打（仅 1–2 向听 + 前若干巡，双重衰减）
+    danger_first = build_no_threat_danger_first_bonuses(
+        candidates,
+        offenses,
+        defense,
+        turn=getattr(dp, "turn", None),
+        min_shanten=min_shanten,
     )
 
     for candidate, offense in zip(candidates, offenses):
@@ -634,6 +960,15 @@ def score_candidates(
         keep_penalty = yakuhai_keep.get(tile, 0.0)
         if keep_penalty:
             utility -= keep_penalty
+        ladder_penalty = honor_ladder.get(tile, 0.0)
+        if ladder_penalty:
+            utility -= ladder_penalty
+        terminal_vs_yak_penalty = terminal_vs_yak.get(tile, 0.0)
+        if terminal_vs_yak_penalty:
+            utility -= terminal_vs_yak_penalty
+        danger_first_bonus = danger_first.get(tile, 0.0)
+        if danger_first_bonus:
+            utility += danger_first_bonus
         chiitoitsu_tiebreak = _as_float(chiitoitsu_tb.get(tile))
         if chiitoitsu_tiebreak:
             utility -= chiitoitsu_tiebreak
@@ -656,6 +991,9 @@ def score_candidates(
         candidate["risk_cost"] = risk_cost
         candidate["risk_cost_scaled"] = scaled_risk
         candidate["yakuhai_keep_penalty"] = keep_penalty
+        candidate["honor_ladder_penalty"] = ladder_penalty
+        candidate["terminal_vs_yakuhai_penalty"] = terminal_vs_yak_penalty
+        candidate["danger_first_bonus"] = danger_first_bonus
         candidate["chiitoitsu_tiebreak"] = chiitoitsu_tiebreak
         candidate["noten_credit"] = noten_credit
         candidate["noten_components"] = noten_components

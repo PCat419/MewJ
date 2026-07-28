@@ -937,6 +937,7 @@ def _attach_defense(dp: DecisionPoint, analysis: Dict[str, Any]) -> Dict[str, An
             "alphas": {},
             "per_seat": {},
             "combined": {},
+            "latent_combined": None,
         }
 
     cands = analysis.get("candidates") or []
