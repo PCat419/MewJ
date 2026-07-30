@@ -310,9 +310,10 @@ PARAMS = {
         "bad_dama_points": 5200,
         # 确定翻数 ≥ 该值（跳满+）→ 一律默听
         "always_dama_han": 6,
-        # 立直/默听线 Softmax：立直线效用 = 最优默听效用 ± margin（与 scoring.temperature 同尺度）
+        # 立直/默听线 Softmax：立直线效用 = 最优听牌切（宣言切）效用 ± margin
+        # （与 scoring.temperature 同尺度）。非先制减偏置也用本值。
         "line_margin": 300.0,
-        # 无役必须立直时加大偏置
+        # 仅先制无役推立直时使用的加大偏置；非先制不得用此值强推/猛砸
         "line_margin_no_yaku": 800.0,
     },
     # ------------------------------------------------------------------

@@ -36,13 +36,11 @@ if not "%SEAT%"=="" set "SEAT_ARGS=--seat %SEAT%"
 set "NANIKIRU_PORT=50000"
 set "STARTED_NANIKIRU=0"
 
-rem Locate nanikiru.exe: env var > MewJ/engine/ > repo-level mahjong-cpp build
+rem Locate nanikiru.exe: env var > MewJ/engine/ (portable; no ../mahjong-cpp)
 if defined MEWJ_NANIKIRU_EXE (
     set "NANIKIRU=%MEWJ_NANIKIRU_EXE%"
-) else if exist "%~dp0engine\nanikiru.exe" (
-    set "NANIKIRU=%~dp0engine\nanikiru.exe"
 ) else (
-    set "NANIKIRU=%~dp0..\mahjong-cpp\build\src\server\nanikiru.exe"
+    set "NANIKIRU=%~dp0engine\nanikiru.exe"
 )
 for %%I in ("%NANIKIRU%") do set "NANIKIRU_DIR=%%~dpI"
 

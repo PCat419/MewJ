@@ -783,10 +783,19 @@ def _parse_response(
         tenpai_arr = st.get("tenpai_prob") or []
         win_arr = st.get("win_prob") or []
         exp_arr = st.get("exp_score") or []
+        tenpai_riichi_arr = st.get("tenpai_prob_riichi") or []
+        win_riichi_arr = st.get("win_prob_riichi") or []
+        exp_riichi_arr = st.get("exp_score_riichi") or []
         has_probs = bool(tenpai_arr or win_arr or exp_arr)
         tenpai = _at_turn(tenpai_arr, dp.turn) if has_probs else None
         win = _at_turn(win_arr, dp.turn) if has_probs else None
         exp = _at_turn(exp_arr, dp.turn) if has_probs else None
+        has_riichi_probs = bool(tenpai_riichi_arr or win_riichi_arr or exp_riichi_arr)
+        tenpai_riichi = (
+            _at_turn(tenpai_riichi_arr, dp.turn) if has_riichi_probs else None
+        )
+        win_riichi = _at_turn(win_riichi_arr, dp.turn) if has_riichi_probs else None
+        exp_riichi = _at_turn(exp_riichi_arr, dp.turn) if has_riichi_probs else None
         necessary = []
         for nt in st.get("necessary_tiles") or []:
             nt_id = nt.get("tile")
@@ -829,6 +838,10 @@ def _parse_response(
                 "tenpai_prob_arr": tenpai_arr if has_probs else None,
                 "win_prob": win,
                 "exp_score": exp,
+                # 立直续航（门清听牌时引擎另搜）；默听排序仍用上方 exp_score
+                "tenpai_prob_riichi": tenpai_riichi,
+                "win_prob_riichi": win_riichi,
+                "exp_score_riichi": exp_riichi,
                 "uke": uke,
                 "necessary_tiles": necessary[:14],
                 "furiten": is_furiten,

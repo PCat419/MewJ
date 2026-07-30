@@ -270,6 +270,24 @@
             "type": "number"
           }
         },
+        "tenpai_prob_riichi": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/probability"
+          }
+        },
+        "win_prob_riichi": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/probability"
+          }
+        },
+        "exp_score_riichi": {
+          "type": "array",
+          "items": {
+            "type": "number"
+          }
+        },
         "necessary_tiles": {
           "type": "array",
           "items": {

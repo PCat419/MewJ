@@ -267,10 +267,14 @@ def _riichi_merged_cand_rows(
     actual_tile: Any,
     is_riichi: bool,
     show_uke_only: bool,
+    actual_ankan: Any = None,
+    actual_kakan: Any = None,
 ) -> str:
-    """牌效表：立直元动作 + 全部切牌，共用 line_options 权重。"""
+    """牌效表：立直元动作 + 全部切牌 + 暗杠/加杠。"""
     line_opts = list(rd.get("line_options") or [])
-    if not line_opts:
+    kakan_opts = list(analysis.get("kakan_options") or [])
+    ankan_opts = list(analysis.get("ankan_options") or [])
+    if not line_opts and not kakan_opts and not ankan_opts:
         return ""
     by_tile = {
         str(c.get("tile")): c for c in (analysis.get("candidates") or []) if c.get("tile")
@@ -278,20 +282,20 @@ def _riichi_merged_cand_rows(
     rec = rd.get("recommend")
     dama_tile = rd.get("dama_tile")
     actual_n = str(actual_tile or "")
+    rec_action = analysis.get("recommend_action") or "discard"
+    best_kakan = analysis.get("best_kakan")
+    best_ankan = analysis.get("best_ankan")
+    best_ankan_kind = str(analysis.get("best_ankan_kind") or "")
 
-    def _sort_key(o: dict):
-        w = o.get("recommendation_weight")
-        return -(float(w) if w is not None else -1.0)
+    _rows: list = []  # (weight, html)
 
-    line_opts.sort(key=_sort_key)
-    rows = ""
     for o in line_opts:
         action = o.get("action")
         mark = ""
         if action == "riichi":
-            if rec == "riichi":
+            if rec == "riichi" and rec_action not in ("kakan", "ankan"):
                 mark += " best"
-            if is_riichi:
+            if is_riichi and not actual_ankan and not actual_kakan:
                 mark += " actual"
             label = "立直"
             shanten_cell = "<td>—</td>"
@@ -301,9 +305,18 @@ def _riichi_merged_cand_rows(
         else:
             tile = o.get("tile")
             c = by_tile.get(str(tile)) or {}
-            if rec == "dama" and tile == dama_tile:
+            if (
+                rec == "dama"
+                and tile == dama_tile
+                and rec_action not in ("kakan", "ankan")
+            ):
                 mark += " best"
-            if (not is_riichi) and str(tile) == actual_n:
+            if (
+                (not is_riichi)
+                and not actual_ankan
+                and not actual_kakan
+                and str(tile) == actual_n
+            ):
                 mark += " actual"
             if c.get("policy_rejected") or c.get("kuikae") or o.get("policy_rejected"):
                 mark += " rejected"
@@ -320,15 +333,79 @@ def _riichi_merged_cand_rows(
             )
             deal = (c.get("deal_in") or {}) if c else {}
             deal_cell = _deal_in_cell(deal.get("combined"))
-        rows += (
-            f"<tr class='{mark}'>"
-            f"<td>{label}</td>"
-            f"{shanten_cell}{uke_cell}{exp_cell}{deal_cell}"
-            f"<td>{_fmt_score(o.get('adjusted_utility'))}</td>"
-            f"<td class='weight'>{_fmt_weight(o.get('recommendation_weight'))}</td>"
-            f"</tr>"
+        _rows.append(
+            (
+                o.get("recommendation_weight"),
+                f"<tr class='{mark}'>"
+                f"<td>{label}</td>"
+                f"{shanten_cell}{uke_cell}{exp_cell}{deal_cell}"
+                f"<td>{_fmt_score(o.get('adjusted_utility'))}</td>"
+                f"<td class='weight'>{_fmt_weight(o.get('recommendation_weight'))}</td>"
+                f"</tr>",
+            )
         )
-    return rows
+
+    def _kan_row(o: dict, *, is_ankan: bool) -> None:
+        mark = ""
+        tile = o.get("tile")
+        tiles = o.get("tiles") or ([tile] if tile else [])
+        kind_o = str(o.get("kind") or "")
+        if is_ankan:
+            ak = str(actual_ankan or "")
+            kind_a = ("5" + ak[1:]) if ak.startswith("0") else ak
+            if ak and (str(tile) == ak or (kind_o and kind_o == kind_a)):
+                mark += " actual"
+            bk = str(best_ankan or "")
+            if rec_action == "ankan" and (
+                (bk and str(tile) == bk) or (best_ankan_kind and kind_o == best_ankan_kind)
+            ):
+                mark += " best"
+        else:
+            if actual_kakan and str(tile) == str(actual_kakan):
+                mark += " actual"
+            if rec_action == "kakan" and str(tile) == str(best_kakan or ""):
+                mark += " best"
+        if o.get("rejected") or o.get("hard_block"):
+            mark += " rejected"
+        exp_cell = (
+            "<td class='na'>—</td>"
+            if show_uke_only or o.get("ev") is None
+            else f"<td>{_fmt_score(o.get('ev'))}</td>"
+        )
+        deal = o.get("deal_in") or {}
+        deal_cell = _deal_in_cell(deal.get("combined"))
+        sh = o.get("cut_shanten")
+        if sh is None:
+            sh = o.get("shanten")
+        if is_ankan and len(tiles) >= 4:
+            imgs = "".join(_tile_img(t, tile_base) for t in tiles[:4])
+            label = f"杠 {imgs}"
+        else:
+            label = f"杠 {_tile_img(tile, tile_base)}"
+        _rows.append(
+            (
+                o.get("recommendation_weight"),
+                f"<tr class='{mark.strip()}'>"
+                f"<td>{label}</td>"
+                f"<td>{_esc(sh if sh is not None else '—')}</td>"
+                f"<td class='uke'>—</td>"
+                f"{exp_cell}{deal_cell}"
+                f"<td>{_fmt_score(o.get('adjusted_utility'))}</td>"
+                f"<td class='weight'>{_fmt_weight(o.get('recommendation_weight'))}</td>"
+                f"</tr>",
+            )
+        )
+
+    for o in kakan_opts:
+        _kan_row(o, is_ankan=False)
+    for o in ankan_opts:
+        _kan_row(o, is_ankan=True)
+
+    if any(w is not None for w, _ in _rows):
+        _rows.sort(
+            key=lambda rw: -(float(rw[0]) if rw[0] is not None else -1.0)
+        )
+    return "".join(html for _, html in _rows)
 
 
 def _riichi_cut_turn_html(d: dict, ky: dict, tile_base: str, seq: int):
@@ -673,7 +750,17 @@ def render_classic_html(report: dict, tile_base: str = "../assets/tiles") -> str
                     actual_tile=actual,
                     is_riichi=bool(d.get("is_riichi")),
                     show_uke_only=show_uke_only,
+                    actual_ankan=d.get("actual_ankan"),
+                    actual_kakan=d.get("actual_kakan"),
                 )
+                d["_has_kakan_rows"] = bool(
+                    analysis.get("kakan_options") or analysis.get("ankan_options")
+                )
+                d["_rec_action"] = analysis.get("recommend_action") or "discard"
+                d["_best_kakan"] = analysis.get("best_kakan")
+                d["_best_ankan"] = analysis.get("best_ankan")
+                d["_actual_kakan"] = d.get("actual_kakan")
+                d["_actual_ankan"] = d.get("actual_ankan")
             else:
                 # 候选按推荐权重降序渲染（权重=综合效用 softmax，与推荐徽标口径一致；
                 # 无权重时保持原顺序，即向听数→牌效EV）

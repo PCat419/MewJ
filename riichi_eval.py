@@ -348,6 +348,19 @@ def _cand_utility(c: Dict[str, Any]) -> float:
         return -1e18
 
 
+def _cand_riichi_utility(c: Dict[str, Any]) -> float:
+    """立直线锚点：在已含危险/罚符的默听效用上，把进攻 EV 换成立直续航。"""
+    base = _cand_utility(c)
+    try:
+        dama_ev = c.get("exp_score")
+        riichi_ev = c.get("exp_score_riichi")
+        if dama_ev is None or riichi_ev is None:
+            return base
+        return base - float(dama_ev) + float(riichi_ev)
+    except (TypeError, ValueError):
+        return base
+
+
 def _all_cands(analysis: Dict[str, Any]) -> List[Dict[str, Any]]:
     """全部可展示切牌（仅排除食替）；含姿态否决项，便于牌效表完整列出。"""
     return [
@@ -417,7 +430,8 @@ def build_line_options(
 ) -> List[Dict[str, Any]]:
     """立直元动作与各切牌共用 Softmax 权重（含姿态否决切，表中标 rejected）。
 
-    立直线效用 = 最优未否决切效用 ± margin；若无未否决切则相对全体最优切偏置。
+    立直线效用 = 最优听牌切的立直续航效用 ± margin；无听牌切时回退到
+    最优未否决切。默听切仍用默听综合效用（含手替改听的 exp_score）。
     """
     dama_cands = _all_cands(analysis)
     temperature = float(_P_SC.get("temperature", DEFAULT_TEMPERATURE))
@@ -426,17 +440,32 @@ def build_line_options(
     )
 
     dama_utils = [_cand_utility(c) for c in dama_cands]
-    # 偏置锚点：优先用姿态仍允许的切，避免否决烂牌抬高立直基准
-    policy_utils = [
-        _cand_utility(c) for c in dama_cands if not c.get("policy_rejected")
-    ]
-    best_dama_u = max(policy_utils) if policy_utils else (
-        max(dama_utils) if dama_utils else 0.0
-    )
-    if prefer_riichi:
-        riichi_u = best_dama_u + margin
+    # 锚点：宣言切用立直续航效用（有 exp_score_riichi 时）
+    tenpai_cands = _tenpai_cands(analysis)
+    anchor_tile: Optional[str] = None
+    if tenpai_cands:
+        anchor = max(
+            tenpai_cands,
+            key=lambda c: (
+                _cand_riichi_utility(c),
+                str(c.get("tile") or ""),
+            ),
+        )
+        anchor_u = _cand_riichi_utility(anchor)
+        anchor_tile = anchor.get("tile")
     else:
-        riichi_u = best_dama_u - margin
+        policy_utils = [
+            _cand_utility(c) for c in dama_cands if not c.get("policy_rejected")
+        ]
+        anchor_u = (
+            max(policy_utils)
+            if policy_utils
+            else (max(dama_utils) if dama_utils else 0.0)
+        )
+    if prefer_riichi:
+        riichi_u = anchor_u + margin
+    else:
+        riichi_u = anchor_u - margin
 
     all_utils = [riichi_u] + dama_utils
     weights = softmax_weights(all_utils, temperature)
@@ -444,7 +473,7 @@ def build_line_options(
     options: List[Dict[str, Any]] = [
         {
             "action": "riichi",
-            "tile": None,
+            "tile": anchor_tile,
             "adjusted_utility": riichi_u,
             "recommendation_weight": weights[0],
         }
@@ -732,14 +761,14 @@ def decide(
     out["rule"] = decision.get("rule")
 
     prefer_riichi = decision.get("recommend") == "riichi" and not fold_bias
-    no_yaku = bool(val.get("no_yaku")) and not fold_bias
-    # 无役仍必须立直（即使全弃姿态也不应默听无役）
-    if bool(val.get("no_yaku")):
+    # 无役强制立直：仅先制；非先制尊重 SMS(not_head_start→dama)
+    if bool(val.get("no_yaku")) and head_start and not fold_bias:
         prefer_riichi = True
-        no_yaku = True
+    # 无役大 margin 只用于「先制强制立直」方向；非先制走普通 line_margin
+    use_no_yaku_margin = bool(val.get("no_yaku")) and prefer_riichi
 
     line_options = build_line_options(
-        analysis, prefer_riichi=prefer_riichi, no_yaku=no_yaku
+        analysis, prefer_riichi=prefer_riichi, no_yaku=use_no_yaku_margin
     )
     riichi_cuts = build_riichi_cuts(analysis)
     out["line_options"] = line_options

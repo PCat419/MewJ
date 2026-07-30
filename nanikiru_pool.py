@@ -30,23 +30,15 @@ def _mewj_root() -> Path:
 
 
 def default_nanikiru_exe() -> Path:
+    """Resolve nanikiru.exe for portable MewJ runtime.
+
+    Only ``MEWJ_NANIKIRU_EXE`` or ``MewJ/engine/nanikiru.exe`` — never
+    ``../mahjong-cpp/build`` (MewJ must run without sibling source trees).
+    """
     env = os.environ.get("MEWJ_NANIKIRU_EXE")
-    candidates = []
     if env:
-        candidates.append(Path(env))
-    candidates.append(_mewj_root() / "engine" / "nanikiru.exe")
-    candidates.append(
-        _mewj_root().parent
-        / "mahjong-cpp"
-        / "build"
-        / "src"
-        / "server"
-        / "nanikiru.exe"
-    )
-    for path in candidates:
-        if path.is_file():
-            return path
-    return candidates[0] if env else candidates[1]
+        return Path(env)
+    return _mewj_root() / "engine" / "nanikiru.exe"
 
 
 def nanikiru_port(url: str) -> int:
