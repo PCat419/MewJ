@@ -29,7 +29,12 @@ from .nanikiru_pool import (  # noqa: E402
 )
 from .params import PARAMS as _P  # noqa: E402
 from .posture import Posture, advance, apply_posture, evaluate_posture  # noqa: E402
-from .replay import CallOpportunity, DecisionPoint, extract_kyoku_views  # noqa: E402
+from .replay import (  # noqa: E402
+    CallOpportunity,
+    DecisionPoint,
+    extract_kyoku_views,
+    viewer_tj_index,
+)
 from .scoring import (  # noqa: E402
     ACCEPTABLE_WEIGHT_RATIO,
     DEFAULT_TEMPERATURE,
@@ -1155,9 +1160,19 @@ _TENHOU_VIEWER_KEYS = (
 )
 
 
-def _tenhou_viewer_payload(paipu: dict) -> dict:
-    """Strip MewJ-only fields; keep a tenhou.net/6 JSON suitable for /5 viewer."""
-    return {k: paipu[k] for k in _TENHOU_VIEWER_KEYS if k in paipu}
+def _tenhou_viewer_bundle(paipu: dict) -> dict:
+    """Meta + per-kyoku logs for the embedded Tenhou viewer (Mortal-style)."""
+    base = {k: paipu[k] for k in _TENHOU_VIEWER_KEYS if k in paipu and k != "log"}
+    return {
+        "base": base,
+        "kyokus": list(paipu.get("log") or []),
+    }
+
+
+def _viewer_tj_for(dp: Any, tj_map: dict) -> Optional[int]:
+    if isinstance(dp, CallOpportunity):
+        return tj_map.get("discard", {}).get(len(dp.discards_log or []))
+    return tj_map.get("acquire", {}).get((dp.seat, dp.turn))
 
 
 def review_paipu(
@@ -1255,6 +1270,11 @@ def _review_paipu_body(
     for view in views:
         # Plan which decisions will be analyzed (max_turns is chronological).
         planned: List[Tuple[Any, bool]] = []
+        raw_kyoku = (paipu.get("log") or [None])[view.index]
+        try:
+            tj_map = viewer_tj_index(raw_kyoku) if raw_kyoku is not None else {}
+        except Exception:
+            tj_map = {}
         for dp in view.decisions:
             if max_turns is not None and analyzed + sum(
                 1 for _, a in planned if a
@@ -1308,6 +1328,7 @@ def _review_paipu_body(
                     "actual": dp.actual,
                     "actual_tiles": dp.actual_tiles,
                     "actual_cut": dp.actual_cut,
+                    "viewer_tj": _viewer_tj_for(dp, tj_map),
                     "legal_summary": {
                         "pon": len((dp.legal or {}).get("pon") or []),
                         "chii": len((dp.legal or {}).get("chii") or []),
@@ -1390,6 +1411,7 @@ def _review_paipu_body(
                         "is_riichi_post": bool(getattr(dp, "is_riichi_post", False)),
                         "is_riichi": dp.is_riichi_discard,
                         "is_tsumogiri": dp.is_tsumogiri,
+                        "viewer_tj": _viewer_tj_for(dp, tj_map),
                         "analysis": None,
                         "skipped": True,
                     }
@@ -1414,6 +1436,7 @@ def _review_paipu_body(
                 "is_riichi_post": bool(getattr(dp, "is_riichi_post", False)),
                 "is_riichi": dp.is_riichi_discard,
                 "is_tsumogiri": dp.is_tsumogiri,
+                "viewer_tj": _viewer_tj_for(dp, tj_map),
                 "analysis": None,
                 "skipped": False,
             }
@@ -1533,6 +1556,7 @@ def _review_paipu_body(
                         "seat_wind": dp.seat_wind,
                         "actual": dp.actual_discard,
                         "is_riichi": True,
+                        "viewer_tj": _viewer_tj_for(dp, tj_map),
                         "analysis": {
                             "ok": True,
                             "riichi_cuts": rd.get("riichi_cuts") or [],
@@ -1570,6 +1594,6 @@ def _review_paipu_body(
         "seat": seat,
         "player": (paipu.get("name") or [None] * 4)[seat],
         "kyokus": report_kyokus,
-        # Slim tenhou.net/6 payload for the embedded viewer (full game).
-        "tenhou": _tenhou_viewer_payload(paipu),
+        # Meta + per-kyoku logs for Mortal-style embedded Tenhou viewer.
+        "tenhou": _tenhou_viewer_bundle(paipu),
     }

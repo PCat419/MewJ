@@ -10,6 +10,7 @@ from typing import Any, Optional
 
 _MEWJ_ROOT = Path(__file__).resolve().parent
 _TILE_DIR = _MEWJ_ROOT / "assets" / "tiles"
+_VIEWER_FILE = _MEWJ_ROOT / "assets" / "tenhou" / "viewer.html"
 
 
 _WIND_ZH = {
@@ -22,6 +23,18 @@ _WIND_ZH = {
 
 def _esc(s: Any) -> str:
     return html.escape("" if s is None else str(s))
+
+
+def _viewer_data_attrs(d: dict, ky_index: int) -> str:
+    """data-kyoku / data-tj for syncing the embedded Tenhou viewer."""
+    parts = [f'data-kyoku="{int(ky_index)}"']
+    tj = d.get("viewer_tj")
+    if tj is not None:
+        try:
+            parts.append(f'data-tj="{int(tj)}"')
+        except (TypeError, ValueError):
+            pass
+    return " " + " ".join(parts)
 
 
 def _fmt_weight(value) -> str:
@@ -490,9 +503,9 @@ def _riichi_cut_turn_html(d: dict, ky: dict, tile_base: str, seq: int):
                     </table></div>"""
 
     tid = f"t{ky.get('index')}_{d.get('turn')}_riichi_{seq}"
-    turn_open = " open" if match is False else ""
+    vattrs = _viewer_data_attrs(d, int(ky.get("index") or 0))
     row = f"""
-                <details class="turn {status}" id="{tid}"{turn_open}>
+                <details class="turn {status}" id="{tid}"{vattrs}>
                   <summary class="turn-head">
                     <strong>{_esc(d.get('label') or '立直')}</strong>
                     {badge}
@@ -638,10 +651,10 @@ def _call_turn_html(d: dict, ky: dict, tile_base: str, seq: int):
 
     tid = f"t{ky.get('index')}_{d.get('turn')}_c{seq}"
     short = str(actual_zh)
-    turn_open = " open" if match is False else ""
+    vattrs = _viewer_data_attrs(d, int(ky.get("index") or 0))
 
     row = f"""
-                <details class="turn {status}" id="{tid}"{turn_open}>
+                <details class="turn {status}" id="{tid}"{vattrs}>
                   <summary class="turn-head">
                     <strong>{_esc(d.get('label'))}</strong>
                     {badge}
@@ -662,7 +675,11 @@ def _call_turn_html(d: dict, ky: dict, tile_base: str, seq: int):
     return row, (tid, short, status)
 
 
-def render_classic_html(report: dict, tile_base: str = "../assets/tiles") -> str:
+def render_classic_html(
+    report: dict,
+    tile_base: str = "../assets/tiles",
+    viewer_base: str = "../assets/tenhou/viewer.html",
+) -> str:
     sections = []
     side_groups = []
     names = report.get("names") or []
@@ -997,15 +1014,10 @@ def render_classic_html(report: dict, tile_base: str = "../assets/tiles") -> str
             tid = f"t{ky.get('index')}_{d.get('turn')}"
             short = str(d.get("label") or "").split()[-1] or f"第{d.get('turn')}巡"
             nav_items.append((tid, short, status))
-            turn_open = (
-                " open"
-                if match is False and analysis.get("match_kind") != "acceptable"
-                else ""
-            )
 
             rows.append(
                 f"""
-                <details class="turn {status}" id="{tid}"{turn_open}>
+                <details class="turn {status}" id="{tid}"{_viewer_data_attrs(d, int(ky.get("index") or 0))}>
                   <summary class="turn-head">
                     <strong>{_esc(d.get('label'))}</strong>
                     {badge}
@@ -1057,7 +1069,7 @@ def render_classic_html(report: dict, tile_base: str = "../assets/tiles") -> str
             )
         sections.append(
             f"""
-            <details class="kyoku" id="k{ky.get('index')}" open>
+            <details class="kyoku" id="k{ky.get('index')}" data-kyoku="{ky.get('index')}" open>
               <summary class="kyoku-head">
                 <h2>{_esc(ky.get('label'))}</h2>
                 {wind_html}
@@ -1110,20 +1122,50 @@ def render_classic_html(report: dict, tile_base: str = "../assets/tiles") -> str
     )
 
     tenhou = report.get("tenhou")
-    if tenhou:
-        # Embed like mjai-reviewer: single-quoted src + raw #json=…
-        # Do NOT html.escape into <script> — script text does not decode
-        # entities, so &quot; breaks JSON.parse inside tenhou.net/5.
+    tenhou_bundle_json = ""
+    # Local viewer (vendored 1129.js) — avoids waiting on tenhou.net page load.
+    # Tile images still come from cdn.tenhou.net (browser-cached after first kyoku).
+    viewer_url = (viewer_base or "../assets/tenhou/viewer.html").replace("\\", "/")
+    if isinstance(tenhou, dict) and isinstance(tenhou.get("kyokus"), list):
+        # New Mortal-style bundle: base meta + per-kyoku logs.
+        tenhou_bundle_json = json.dumps(
+            tenhou, ensure_ascii=False, separators=(",", ":")
+        ).replace("</", "<\\/")
+        kyokus_log = tenhou.get("kyokus") or []
+        base = tenhou.get("base") or {}
+        if kyokus_log:
+            first_payload = dict(base)
+            first_payload["log"] = [kyokus_log[0]]
+            first_raw = json.dumps(
+                first_payload, ensure_ascii=False, separators=(",", ":")
+            )
+            viewer_src = (
+                f"{viewer_url}?tw={seat}&ts=0&_k=0#json={first_raw}".replace("'", "%27")
+            )
+        else:
+            viewer_src = f"{viewer_url}?tw={seat}"
+        player_pane = f"""
+    <aside class="player-pane">
+      <div class="player-head">
+        <span class="player-title">牌谱回放</span>
+      </div>
+      <iframe id="tenhou-player" class="tenhou" title="牌谱回放"
+        src='{viewer_src}'
+        frameborder="0" scrolling="no" allowfullscreen></iframe>
+      <script type="application/json" id="tenhou-bundle">{tenhou_bundle_json}</script>
+    </aside>"""
+    elif isinstance(tenhou, dict) and "log" in tenhou:
+        # Legacy full-game payload.
         tenhou_raw = json.dumps(tenhou, ensure_ascii=False, separators=(",", ":"))
         viewer_src = (
-            f"https://tenhou.net/5/?tw={seat}#json={tenhou_raw}".replace("'", "%27")
+            f"{viewer_url}?tw={seat}#json={tenhou_raw}".replace("'", "%27")
         )
         player_pane = f"""
     <aside class="player-pane">
       <div class="player-head">
         <span class="player-title">牌谱回放</span>
       </div>
-      <iframe id="tenhou-player" class="tenhou" title="天凤牌谱回放"
+      <iframe id="tenhou-player" class="tenhou" title="牌谱回放"
         src='{viewer_src}'
         frameborder="0" scrolling="no" allowfullscreen loading="lazy"></iframe>
     </aside>"""
@@ -1521,6 +1563,77 @@ table.riichi tr .deal-in.safe {{ color:var(--ok); font-weight:700; }}
 <script type="application/json" id="report-json">{report_json}</script>
 <script>
 var analysisScroll = document.getElementById('analysis-scroll');
+var viewerSeat = {seat};
+var viewerBase = {json.dumps(viewer_url)};
+var tenhouBundle = (function () {{
+  var el = document.getElementById('tenhou-bundle');
+  if (!el) return null;
+  try {{ return JSON.parse(el.textContent); }} catch (e) {{ return null; }}
+}})();
+var lastViewerKey = null;
+var pendingSeek = null;
+var seekFlushTimer = null;
+var suppressSideSeek = false;
+
+function parseKyokuIndex(raw) {{
+  if (raw == null || raw === '') return NaN;
+  var s = String(raw);
+  if (s.charAt(0) === 'k' || s.charAt(0) === 'K') s = s.slice(1);
+  return parseInt(s, 10);
+}}
+
+function applyViewerSeek(ki, tjNum) {{
+  var frame = document.getElementById('tenhou-player');
+  if (!frame || !tenhouBundle || !tenhouBundle.kyokus) return;
+  if (isNaN(ki) || !tenhouBundle.kyokus[ki]) return;
+  var key = ki + ':' + (tjNum == null ? '' : tjNum);
+  if (key === lastViewerKey) return;
+  lastViewerKey = key;
+  var payload = {{}};
+  var base = tenhouBundle.base || {{}};
+  Object.keys(base).forEach(function (k) {{ payload[k] = base[k]; }});
+  payload.log = [tenhouBundle.kyokus[ki]];
+  // Query must change on each seek: browsers skip reload when only #hash changes.
+  var q = '?tw=' + viewerSeat + '&ts=0&_k=' + ki;
+  if (tjNum != null) q += '&tj=' + tjNum + '&_t=' + tjNum;
+  frame.src = viewerBase + q + '#json=' + JSON.stringify(payload);
+}}
+
+function flushViewerSeek() {{
+  seekFlushTimer = null;
+  var p = pendingSeek;
+  pendingSeek = null;
+  if (!p) return;
+  applyViewerSeek(p.ki, p.tjNum);
+}}
+
+function seekViewer(kyokuIndex, tj) {{
+  if (!tenhouBundle || !tenhouBundle.kyokus) return;
+  var ki = parseKyokuIndex(kyokuIndex);
+  if (isNaN(ki) || !tenhouBundle.kyokus[ki]) return;
+  var tjNum = (tj == null || tj === '') ? null : parseInt(tj, 10);
+  if (tjNum != null && isNaN(tjNum)) tjNum = null;
+  // Opening a kyoku fires both "seek to start" and "seek to turn" in one tick;
+  // keep the more specific target (same kyoku + tj beats bare kyoku).
+  if (pendingSeek && pendingSeek.ki === ki) {{
+    if (tjNum == null && pendingSeek.tjNum != null) return;
+  }}
+  pendingSeek = {{ ki: ki, tjNum: tjNum }};
+  if (seekFlushTimer != null) return;
+  seekFlushTimer = setTimeout(flushViewerSeek, 0);
+}}
+
+function seekKyokuFromEl(el) {{
+  if (!el) return;
+  var ky = el.getAttribute('data-kyoku');
+  if (ky == null || ky === '') {{
+    var host = el.closest('[data-kyoku]');
+    if (host) ky = host.getAttribute('data-kyoku');
+  }}
+  if (ky == null || ky === '') return;
+  var tjAttr = el.getAttribute('data-tj');
+  seekViewer(ky, tjAttr);
+}}
 
 document.addEventListener('click', function (e) {{
   var btn = e.target.closest('.tab-btn');
@@ -1552,9 +1665,15 @@ function exclusiveDetails(selector, scopeFn) {{
 
 function syncSideToKyoku(kyoku) {{
   if (!kyoku || !kyoku.id) return;
-  document.querySelectorAll('aside.side details.side-group').forEach(function (g) {{
-    g.open = (g.getAttribute('data-kyoku') === kyoku.id);
-  }});
+  // Programmatic TOC sync must not seek to kyoku start (would race turn seek).
+  suppressSideSeek = true;
+  try {{
+    document.querySelectorAll('aside.side details.side-group').forEach(function (g) {{
+      g.open = (g.getAttribute('data-kyoku') === kyoku.id);
+    }});
+  }} finally {{
+    suppressSideSeek = false;
+  }}
 }}
 
 function openTurnById(id) {{
@@ -1571,6 +1690,7 @@ function openTurnById(id) {{
     if (el !== turn) el.open = false;
   }});
   turn.open = true;
+  seekKyokuFromEl(turn);
   return turn;
 }}
 
@@ -1609,9 +1729,15 @@ function revealTurn(id) {{
   }});
 }}
 
-// 目录：一次只展开一局
+// 目录：一次只展开一局；用户手动展开目录局时同步回放（局开头）
 exclusiveDetails('aside.side details.side-group');
-// 正文：一次只展开一巡（全局，跨局）；展开巡目时同步左侧目录到当局
+document.querySelectorAll('aside.side details.side-group').forEach(function (el) {{
+  el.addEventListener('toggle', function () {{
+    if (!el.open || suppressSideSeek) return;
+    seekViewer(el.getAttribute('data-kyoku'), null);
+  }});
+}});
+// 正文：一次只展开一巡；展开巡目时同步回放到该巡
 document.querySelectorAll('details.turn').forEach(function (el) {{
   el.addEventListener('toggle', function () {{
     if (!el.open) return;
@@ -1623,14 +1749,18 @@ document.querySelectorAll('details.turn').forEach(function (el) {{
       kyoku.open = true;
       syncSideToKyoku(kyoku);
     }}
+    seekKyokuFromEl(el);
   }});
 }});
 
-// 右侧展开某局时，左侧目录同步切换到当局
+// 展开某局时：左侧目录同步；若有打开的巡则定位到该巡，否则局开头
 document.querySelectorAll('details.kyoku').forEach(function (el) {{
   el.addEventListener('toggle', function () {{
     if (!el.open) return;
     syncSideToKyoku(el);
+    var openTurn = el.querySelector('details.turn[open]');
+    if (openTurn) seekKyokuFromEl(openTurn);
+    else seekViewer(el.getAttribute('data-kyoku'), null);
   }});
 }});
 
@@ -1656,12 +1786,12 @@ window.addEventListener('hashchange', function () {{
   revealTurn((location.hash || '').replace(/^#/, ''));
 }});
 
-// 初始若有多巡展开，只保留第一处；若 URL 带巡目锚点则展开该巡
+// 初始：全部巡目收起；默认第一局回放；若有锚点则展开该巡并定位
 (function () {{
-  var opened = Array.prototype.slice.call(document.querySelectorAll('details.turn[open]'));
-  opened.slice(1).forEach(function (el) {{ el.open = false; }});
+  document.querySelectorAll('details.turn').forEach(function (el) {{ el.open = false; }});
   var sideOpened = Array.prototype.slice.call(document.querySelectorAll('aside.side details.side-group[open]'));
   sideOpened.slice(1).forEach(function (el) {{ el.open = false; }});
+  lastViewerKey = '0:';
   var hashId = (location.hash || '').replace(/^#/, '');
   if (hashId) {{
     var group = document.querySelector('.side-turns a[href="#' + hashId + '"]');
@@ -1671,7 +1801,6 @@ window.addEventListener('hashchange', function () {{
     }}
     revealTurn(hashId);
   }} else {{
-    // 无锚点时：左侧目录对齐正文当前已展开的第一局
     var firstKy = document.querySelector('details.kyoku[open]');
     if (firstKy) syncSideToKyoku(firstKy);
   }}
@@ -1690,9 +1819,22 @@ def _rel_tile_base(html_path: Path) -> str:
     return rel.replace("\\", "/")
 
 
+def _rel_viewer_base(html_path: Path) -> str:
+    """URL path from the HTML file to the local Tenhou viewer page."""
+    html_dir = html_path.resolve().parent
+    rel = os.path.relpath(_VIEWER_FILE.resolve(), html_dir)
+    return rel.replace("\\", "/")
+
+
 def write_report(report: dict, path: Path) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tile_base = _rel_tile_base(path)
-    path.write_text(render_classic_html(report, tile_base=tile_base), encoding="utf-8")
+    viewer_base = _rel_viewer_base(path)
+    path.write_text(
+        render_classic_html(
+            report, tile_base=tile_base, viewer_base=viewer_base
+        ),
+        encoding="utf-8",
+    )
     return path

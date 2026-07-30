@@ -808,6 +808,162 @@ def iter_seat_decisions(
         actor = caller if caller is not None else (actor + 1) % 4
 
 
+
+def tenhou_ma_nodes(kyoku: list) -> List[dict]:
+    """Build the same step list as tenhou.net/5 ``1129.js`` ``W.wb`` (``Ma``).
+
+    Viewer ``tj`` is a 1-based index into this list (``W.la(tj)`` applies
+    nodes ``0 .. tj-1``).
+    """
+    a: List[Any] = [list(x) if isinstance(x, list) else x for x in kyoku]
+    while len(a) < 17:
+        a.append([])
+    meta = a[0] if a else [0, 0, 0]
+    for m in range(4):
+        need = max(0, len(a[3 * m + 5]), len(a[3 * m + 6])) + 1
+        for g in (1, 2):
+            slot = 4 + 3 * m + g
+            while len(a[slot]) < need:
+                a[slot].append(0)
+    for pad_i in (2, 3):
+        while len(a[pad_i]) < 5:
+            a[pad_i].append(0)
+
+    n: List[dict] = []
+    q = [0, 0, 0, 0]
+    glen = [len(a[5]), len(a[8]), len(a[11]), len(a[14])]
+    p = int(meta[0]) & 3
+    v = 0
+    O = 0
+    S = -1
+
+    while True:
+        D = q[p]
+        E = a[3 * p + 5][D]
+        Dsc = a[3 * p + 6][D]
+        oa = None
+        if isinstance(E, str) and len(E) > 2:
+            mm = re.search(r"[pmc]", E)
+            oa = mm.group(0) if mm else None
+        ga = None
+        if isinstance(Dsc, str) and len(Dsc) > 2:
+            mm = re.search(r"[karf]", Dsc)
+            ga = mm.group(0) if mm else None
+        if ga == "r" and isinstance(Dsc, str):
+            Dsc = int(Dsc[1:])
+        ha = 0
+        if E:
+            if oa == "p":
+                n.append({"node": 2, "H": p, "m": E})
+            elif oa == "m":
+                n.append({"node": 5, "H": p, "m": E})
+                ha = 2
+                O += 1
+            elif oa == "c":
+                n.append({"node": 3, "H": p, "m": E})
+            else:
+                n.append({"node": 0, "H": p, "m": E})
+                if v:
+                    n[-1]["P"] = v
+                    v = 0
+                if O:
+                    v += O
+                    O = 0
+            if S != -1:
+                n[-1]["Fa"] = S
+                S = -1
+        if ga == "r":
+            n.append({"node": 8, "H": p})
+            S = p
+        if E and Dsc and oa != "m":
+            if ga and ga != "r":
+                if ga == "f":
+                    n.append({"node": 7, "H": p, "m": Dsc})
+                    ha = 2
+                elif ga == "a":
+                    n.append({"node": 4, "H": p, "m": Dsc})
+                    ha = 2
+                    v += 1
+                elif ga == "k":
+                    n.append({"node": 6, "H": p, "m": Dsc})
+                    ha = 2
+                    O += 1
+            else:
+                if Dsc == 60 and isinstance(E, int):
+                    mval = E | 256
+                else:
+                    mval = Dsc
+                n.append({"node": 1, "H": p, "m": mval})
+                ha = 1
+                if v:
+                    n[-1]["P"] = v
+                    v = 0
+        q[p] += 1
+        if ha == 2:
+            continue
+        if ha == 1:
+            Ecmp = E if Dsc == 60 else Dsc
+            try:
+                Ecmp_i = int(Ecmp)
+            except (TypeError, ValueError):
+                Ecmp_i = -1
+            called = False
+            for offset, pattern in (
+                (3, r"[pm](\d\d)$"),
+                (2, r"^\d\d[pm](\d\d)"),
+                (1, r"^[pm](\d\d)"),
+            ):
+                mseat = (p + offset) & 3
+                if q[mseat] >= glen[mseat]:
+                    continue
+                Z = a[3 * mseat + 5][q[mseat]]
+                if not isinstance(Z, str):
+                    continue
+                mm = re.search(pattern, Z)
+                if mm and int(mm.group(1)) == Ecmp_i:
+                    p = mseat
+                    called = True
+                    break
+            if called:
+                continue
+        found = False
+        cand = p
+        for _ in range(4):
+            cand = (cand + 1) & 3
+            if q[cand] < glen[cand]:
+                p = cand
+                found = True
+                break
+        if not found:
+            break
+
+    return n
+
+
+def viewer_tj_index(kyoku: list) -> dict:
+    """Maps for Tenhou viewer ``tj`` (1-based Ma index after applying the node).
+
+    ``acquire``: (seat, seat_turn) -> tj
+    ``discard``: discard_seq (1-based) -> tj
+    """
+    nodes = tenhou_ma_nodes(kyoku)
+    acquire: dict = {}
+    discard: dict = {}
+    turns = [0, 0, 0, 0]
+    disc_seq = 0
+    for i, node in enumerate(nodes):
+        tj = i + 1
+        kind = node.get("node")
+        h = int(node.get("H", 0))
+        if kind in (0, 2, 3, 5):
+            turns[h] += 1
+            acquire[(h, turns[h])] = tj
+        elif kind == 1:
+            disc_seq += 1
+            discard[disc_seq] = tj
+    return {"acquire": acquire, "discard": discard}
+
+
 def extract_kyoku_views(
     paipu: dict, seat: int, include_calls: bool = False
 ) -> List[KyokuView]:
