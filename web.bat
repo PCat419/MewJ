@@ -22,19 +22,38 @@ if not exist ".env" (
     exit /b 0
 )
 
+REM Default: hide the console (server auto-exits when the page closes).
+REM Pass --console to keep the terminal visible for debugging.
+if /I "%~1"=="--console" goto :run
+if /I "%~1"=="--hidden" goto :run
+
+set "VBS=%TEMP%\mewj_web_hide.vbs"
+(
+    echo Set sh = CreateObject("WScript.Shell"^)
+    echo sh.Run "cmd /c """"%~f0"""" --hidden", 0, False
+) > "%VBS%"
+wscript //nologo "%VBS%"
+del "%VBS%" >nul 2>nul
+exit /b 0
+
+:run
 set "MEWJ_WEB_HOST=127.0.0.1"
 if not defined MEWJ_WEB_PORT set "MEWJ_WEB_PORT=8765"
 
-echo Starting MewJ Web on http://%MEWJ_WEB_HOST%:%MEWJ_WEB_PORT%/ ...
-echo Close the page or finish a review to exit.
-echo.
+if /I "%~1"=="--console" (
+    echo Starting MewJ Web on http://%MEWJ_WEB_HOST%:%MEWJ_WEB_PORT%/ ...
+    echo Close the page or finish a review to exit.
+    echo.
+)
 
 python "%~dp0web.py"
 set ERR=%ERRORLEVEL%
 if not %ERR%==0 (
-    echo.
-    echo [ERROR] exit code %ERR%
-    pause
+    if /I "%~1"=="--console" (
+        echo.
+        echo [ERROR] exit code %ERR%
+        pause
+    )
     exit /b %ERR%
 )
 exit /b 0

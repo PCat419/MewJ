@@ -1474,9 +1474,10 @@ def _review_paipu_body(
                     else:
                         rd = riichi_eval.evaluate_declare(dp, ana, posture=posture)
                         ana["riichi_declare"] = rd
-                        # 立直线一致/不一致覆盖切牌卡判定：
+                        # 立直卡只比是否宣言（立/不立），不覆盖切牌对错：
                         # - 都立直 → 本巡一致（切哪张交给后续立直卡）
-                        # - 立/默分歧 → 本巡不一致（覆盖切牌「尚可」）
+                        # - 立/不立分歧 → 本巡不一致
+                        # - 都不立直 → 不改 match，切牌对错仍给出牌层
                         # 实加杠巡不走立直覆盖
                         if not getattr(dp, "actual_kakan", None):
                             if (

@@ -270,18 +270,14 @@ def _riichi_merged_cand_rows(
     actual_ankan: Any = None,
     actual_kakan: Any = None,
 ) -> str:
-    """牌效表：立直元动作 + 全部切牌 + 暗杠/加杠。"""
+    """立直卡牌效表：仅立直 / 不立直二元权重（切牌不在此卡展示）+ 暗杠/加杠。"""
+    _ = actual_tile
     line_opts = list(rd.get("line_options") or [])
     kakan_opts = list(analysis.get("kakan_options") or [])
     ankan_opts = list(analysis.get("ankan_options") or [])
     if not line_opts and not kakan_opts and not ankan_opts:
         return ""
-    by_tile = {
-        str(c.get("tile")): c for c in (analysis.get("candidates") or []) if c.get("tile")
-    }
     rec = rd.get("recommend")
-    dama_tile = rd.get("dama_tile")
-    actual_n = str(actual_tile or "")
     rec_action = analysis.get("recommend_action") or "discard"
     best_kakan = analysis.get("best_kakan")
     best_ankan = analysis.get("best_ankan")
@@ -289,58 +285,66 @@ def _riichi_merged_cand_rows(
 
     _rows: list = []  # (weight, html)
 
-    for o in line_opts:
-        action = o.get("action")
-        mark = ""
-        if action == "riichi":
+    riichi_opt = next((o for o in line_opts if o.get("action") == "riichi"), None)
+    dama_opts = [o for o in line_opts if o.get("action") == "dama"]
+    if riichi_opt is not None or dama_opts:
+        riichi_u = riichi_opt.get("adjusted_utility") if riichi_opt else None
+        riichi_w = (
+            float(riichi_opt.get("recommendation_weight") or 0.0)
+            if riichi_opt
+            else 0.0
+        )
+        no_declare_u = (
+            riichi_opt.get("no_declare_utility") if riichi_opt is not None else None
+        )
+        if no_declare_u is None and dama_opts:
+            no_declare_u = max(
+                (
+                    float(o["adjusted_utility"])
+                    for o in dama_opts
+                    if o.get("adjusted_utility") is not None
+                ),
+                default=None,
+            )
+        no_declare_w = sum(
+            float(o.get("recommendation_weight") or 0.0) for o in dama_opts
+        )
+        if riichi_opt is None and dama_opts:
+            # 仅有切侧时，不立直质量视为 1
+            no_declare_w = 1.0
+
+        na_exp = "<td class='na'>—</td>" if show_uke_only else "<td>—</td>"
+        meta_cells = f"<td>—</td><td class='uke'>—</td>{na_exp}<td>—</td>"
+
+        if riichi_opt is not None:
+            mark = ""
             if rec == "riichi" and rec_action not in ("kakan", "ankan"):
                 mark += " best"
             if is_riichi and not actual_ankan and not actual_kakan:
                 mark += " actual"
-            label = "立直"
-            shanten_cell = "<td>—</td>"
-            uke_cell = "<td class='uke'>—</td>"
-            exp_cell = "<td class='na'>—</td>" if show_uke_only else "<td>—</td>"
-            deal_cell = "<td>—</td>"
-        else:
-            tile = o.get("tile")
-            c = by_tile.get(str(tile)) or {}
-            if (
-                rec == "dama"
-                and tile == dama_tile
-                and rec_action not in ("kakan", "ankan")
-            ):
-                mark += " best"
-            if (
-                (not is_riichi)
-                and not actual_ankan
-                and not actual_kakan
-                and str(tile) == actual_n
-            ):
-                mark += " actual"
-            if c.get("policy_rejected") or c.get("kuikae") or o.get("policy_rejected"):
-                mark += " rejected"
-            kuikae_badge = (
-                '<span class="kuikae-badge">食替</span>' if c.get("kuikae") else ""
+            _rows.append(
+                (
+                    riichi_w,
+                    f"<tr class='{mark.strip()}'>"
+                    f"<td>立直</td>{meta_cells}"
+                    f"<td>{_fmt_score(riichi_u)}</td>"
+                    f"<td class='weight'>{_fmt_weight(riichi_w)}</td>"
+                    f"</tr>",
+                )
             )
-            label = f"打 {_tile_img(tile, tile_base)}{kuikae_badge}"
-            shanten_cell = f"<td>{_esc(c.get('shanten') if c.get('shanten') is not None else o.get('shanten'))}</td>"
-            uke_cell = _uke_cell(c, tile_base) if c else "<td class='uke'>—</td>"
-            exp_cell = (
-                "<td class='na'>—</td>"
-                if show_uke_only
-                else f"<td>{_fmt_score(c.get('exp_score') if c else o.get('exp_score'))}</td>"
-            )
-            deal = (c.get("deal_in") or {}) if c else {}
-            deal_cell = _deal_in_cell(deal.get("combined"))
+
+        mark = ""
+        if rec != "riichi" and rec_action not in ("kakan", "ankan"):
+            mark += " best"
+        if (not is_riichi) and not actual_ankan and not actual_kakan:
+            mark += " actual"
         _rows.append(
             (
-                o.get("recommendation_weight"),
-                f"<tr class='{mark}'>"
-                f"<td>{label}</td>"
-                f"{shanten_cell}{uke_cell}{exp_cell}{deal_cell}"
-                f"<td>{_fmt_score(o.get('adjusted_utility'))}</td>"
-                f"<td class='weight'>{_fmt_weight(o.get('recommendation_weight'))}</td>"
+                no_declare_w,
+                f"<tr class='{mark.strip()}'>"
+                f"<td>不立直</td>{meta_cells}"
+                f"<td>{_fmt_score(no_declare_u)}</td>"
+                f"<td class='weight'>{_fmt_weight(no_declare_w)}</td>"
                 f"</tr>",
             )
         )
@@ -948,11 +952,7 @@ def render_classic_html(report: dict, tile_base: str = "../assets/tiles") -> str
                 if rd.get("recommend") == "riichi":
                     recommend = '<span class="rec">推荐：立直</span>'
                 else:
-                    dt = rd.get("dama_tile") or best
-                    if dt:
-                        recommend = (
-                            f'<span class="rec">推荐：{_tile_img(dt, tile_base)}</span>'
-                        )
+                    recommend = '<span class="rec">推荐：不立直</span>'
             elif (analysis.get("recommend_action") == "ankan") or (
                 d.get("_rec_action") == "ankan"
             ):

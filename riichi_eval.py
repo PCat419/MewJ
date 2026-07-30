@@ -1,10 +1,10 @@
-"""先制立直判断（立直 vs 默听）：《统计学麻雀战术》局收支简化阈值。
+"""先制立直判断（立直 vs 不立直）：《统计学麻雀战术》局收支简化阈值。
 
 在门前听牌切牌点上，附加「是否宣言立直」的检讨轴（两阶段，对标 Mortal）：
-1. ``line_options``：立直元动作与各默听切牌共用 Softmax 权重；
+1. ``line_options``：二元推荐（立直 vs 不立直=默听/拒听最优切效用），表内仍列各切；
 2. ``riichi_cuts``：选定立直线后，听牌切的 Softmax 权重。
 
-SMS 阈值决定立直线效用相对最优默听切的偏置（±margin），不单独改切牌 Softmax。
+SMS 阈值决定立直线效用相对锚点的偏置（±margin）。切哪张交给出牌层。
 """
 
 from __future__ import annotations
@@ -18,9 +18,22 @@ from .posture import Posture
 from .scoring import DEFAULT_TEMPERATURE, normalize_tile, softmax_weights
 
 _WAIT_LABEL = {"ryanmen": "良形", "bad": "愚形", "honor": "字牌待"}
-_REC_LABEL = {"riichi": "立直", "dama": "默听"}
+_REC_LABEL = {"riichi": "立直", "dama": "不立直"}
 _P_RD = _P["riichi_declare"]
 _P_SC = _P["scoring"]
+
+
+def _no_declare_utility(dama_cands: List[Dict[str, Any]]) -> Tuple[float, Optional[str]]:
+    """不立直侧效用：优先未姿态否决切的 max；全否决则回退全体。"""
+    if not dama_cands:
+        return 0.0, None
+    policy = [c for c in dama_cands if not c.get("policy_rejected")]
+    pool = policy if policy else dama_cands
+    best = max(
+        pool,
+        key=lambda c: (_cand_utility(c), str(c.get("tile") or "")),
+    )
+    return _cand_utility(best), best.get("tile")
 
 
 def _norm(tile: Any) -> str:
@@ -428,10 +441,10 @@ def build_line_options(
     prefer_riichi: bool,
     no_yaku: bool = False,
 ) -> List[Dict[str, Any]]:
-    """立直元动作与各切牌共用 Softmax 权重（含姿态否决切，表中标 rejected）。
+    """立直 vs 不立直二元 Softmax；表内仍列各切（含姿态否决，标 rejected）。
 
     立直线效用 = 最优听牌切的立直续航效用 ± margin；无听牌切时回退到
-    最优未否决切。默听切仍用默听综合效用（含手替改听的 exp_score）。
+    最优未否决切。不立直侧 = max(各切综合效用)；各切权重在不立直质量内归一。
     """
     dama_cands = _all_cands(analysis)
     temperature = float(_P_SC.get("temperature", DEFAULT_TEMPERATURE))
@@ -467,18 +480,30 @@ def build_line_options(
     else:
         riichi_u = anchor_u - margin
 
-    all_utils = [riichi_u] + dama_utils
-    weights = softmax_weights(all_utils, temperature)
+    no_declare_u, _best_no = _no_declare_utility(dama_cands)
+    meta_w = softmax_weights([riichi_u, no_declare_u], temperature)
+    riichi_w = float(meta_w[0])
+    no_declare_w = float(meta_w[1])
+
+    # 各切在不立直侧内 Softmax，再乘不立直质量，使全表权重和为 1
+    if dama_cands:
+        cut_share = softmax_weights(dama_utils, temperature)
+        cut_weights = [float(s) * no_declare_w for s in cut_share]
+    else:
+        cut_weights = []
 
     options: List[Dict[str, Any]] = [
         {
             "action": "riichi",
             "tile": anchor_tile,
             "adjusted_utility": riichi_u,
-            "recommendation_weight": weights[0],
+            "recommendation_weight": riichi_w,
+            # 二元推荐以效用比较为准（与 Softmax 同向；平局偏立直）
+            "binary_prefer_riichi": riichi_u >= no_declare_u,
+            "no_declare_utility": no_declare_u,
         }
     ]
-    for c, w, u in zip(dama_cands, weights[1:], dama_utils):
+    for c, w, u in zip(dama_cands, cut_weights, dama_utils):
         options.append(
             {
                 "action": "dama",
@@ -645,10 +670,11 @@ def decide(
     *,
     posture: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """对门前听牌点给出立直/默听推荐（两阶段权重，对标 Mortal）。
+    """对门前听牌点给出立直/不立直推荐（二元；切牌交给出牌层）。
 
-    1. ``line_options``：立直元动作 + 各默听切，Softmax 权重；
+    1. ``line_options``：立直 vs 不立直（默听/拒听最优效用）二元权重，表列各切；
     2. ``riichi_cuts``：立直线下听牌切，Softmax 权重。
+    ``recommend`` 为 ``riichi`` / ``dama``（dama=不立直，兼容既有 match）。
     """
     out: Dict[str, Any] = {
         "ok": True,
@@ -678,7 +704,7 @@ def decide(
         out["basis"] = reason
         return out
 
-    # 全弃姿态仍给出立直权重（不跳过）；SMS 偏置改为倾向默听
+    # 全弃姿态仍给出立直权重（不跳过）；SMS 偏置改为倾向不立直
     fold_bias = posture is not None and int(posture) >= int(Posture.FOLD)
 
     cand = _pick_tenpai_candidate(analysis)
@@ -774,48 +800,34 @@ def decide(
     out["line_options"] = line_options
     out["riichi_cuts"] = riichi_cuts
 
-    # 推荐线 = 权重最高的 line_options（与 SMS 偏置一致）
-    best_line = line_options[0] if line_options else None
-    if best_line and best_line.get("action") == "riichi":
-        out["recommend"] = "riichi"
+    # 二元推荐：立直效用 vs 不立直侧 max(切效用)；不以多路切权重冒充
+    riichi_opt = next(
+        (o for o in line_options if o.get("action") == "riichi"), None
+    )
+    if riichi_opt is not None and "binary_prefer_riichi" in riichi_opt:
+        out["recommend"] = (
+            "riichi" if riichi_opt.get("binary_prefer_riichi") else "dama"
+        )
     else:
         out["recommend"] = "dama"
 
     riichi_tile = riichi_cuts[0].get("tile") if riichi_cuts else None
+    # dama_tile：不立直侧最优切，仅供表高亮；切牌推荐交给出牌层
     dama_tile = None
-    for opt in line_options:
-        if (
-            opt.get("action") == "dama"
-            and opt.get("tile")
-            and not opt.get("policy_rejected")
-        ):
-            dama_tile = opt.get("tile")
-            break
-    if dama_tile is None:
-        for opt in line_options:
-            if opt.get("action") == "dama" and opt.get("tile"):
-                dama_tile = opt.get("tile")
-                break
+    _, dama_tile = _no_declare_utility(_all_cands(analysis))
     out["riichi_tile"] = riichi_tile
     out["dama_tile"] = dama_tile
-    out["cut_tile"] = (
-        riichi_tile if out["recommend"] == "riichi" else dama_tile
-    )
+    # 立直时切牌由立直切牌卡负责；不立直时不写 cut_tile（交给 analysis.best）
+    out["cut_tile"] = riichi_tile if out["recommend"] == "riichi" else None
 
     is_riichi = bool(getattr(dp, "is_riichi_discard", False))
     actual_tile = getattr(dp, "actual_discard", None)
     out["match"] = match_actual(is_riichi, out)
-    # 切牌对错与立直线无关：已立直则比立直切；未立直则比默听切
+    # 切牌对错：已立直比立直切；不立直交给出牌卡（此处不比 dama_tile）
     if is_riichi:
         out["tile_match"] = (
             normalize_tile(actual_tile) == normalize_tile(riichi_tile)
             if actual_tile and riichi_tile
-            else None
-        )
-    elif out["recommend"] == "dama":
-        out["tile_match"] = (
-            normalize_tile(actual_tile) == normalize_tile(dama_tile)
-            if actual_tile and dama_tile
             else None
         )
     else:
@@ -824,7 +836,7 @@ def decide(
 
 
 def match_actual(is_riichi_discard: bool, decision: Dict[str, Any]) -> Optional[bool]:
-    """实战是否宣言立直 与 推荐是否一致。跳过评估时返回 None。"""
+    """实战是否宣言立直 与 推荐是否一致（只比立/不立）。跳过评估时返回 None。"""
     if decision.get("skipped") or not decision.get("ok", True):
         return None
     rec = decision.get("recommend")
