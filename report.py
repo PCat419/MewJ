@@ -1089,6 +1089,17 @@ def render_classic_html(report: dict, tile_base: str = "../assets/tiles") -> str
     kyoku_count = len(report.get("kyokus") or [])
     rate = f"{matched / analyzed * 100:.0f}%" if analyzed else "-"
     blunder_rate = f"{blunders / analyzed * 100:.0f}%" if analyzed else "-"
+    seat = int(report.get("seat") or 0)
+    player_name = report.get("player") or ""
+    ref = report.get("ref") or ""
+    subtitle_bits = []
+    if player_name:
+        subtitle_bits.append(_esc(player_name))
+    if ref:
+        subtitle_bits.append(_esc(ref))
+    subtitle_html = (
+        f'<p class="subtitle">{" · ".join(subtitle_bits)}</p>' if subtitle_bits else ""
+    )
     stats_html = (
         '<div class="stats">'
         f'<span class="stat"><b>{kyoku_count}</b> 局</span>'
@@ -1096,6 +1107,41 @@ def render_classic_html(report: dict, tile_base: str = "../assets/tiles") -> str
         f'<span class="stat stat-ok"><b>{rate}</b> 一致率</span>'
         f'<span class="stat stat-bad"><b>{blunder_rate}</b> 恶手率</span>'
         "</div>"
+    )
+
+    tenhou = report.get("tenhou")
+    if tenhou:
+        # Embed like mjai-reviewer: single-quoted src + raw #json=…
+        # Do NOT html.escape into <script> — script text does not decode
+        # entities, so &quot; breaks JSON.parse inside tenhou.net/5.
+        tenhou_raw = json.dumps(tenhou, ensure_ascii=False, separators=(",", ":"))
+        viewer_src = (
+            f"https://tenhou.net/5/?tw={seat}#json={tenhou_raw}".replace("'", "%27")
+        )
+        player_pane = f"""
+    <aside class="player-pane">
+      <div class="player-head">
+        <span class="player-title">牌谱回放</span>
+      </div>
+      <iframe id="tenhou-player" class="tenhou" title="天凤牌谱回放"
+        src='{viewer_src}'
+        frameborder="0" scrolling="no" allowfullscreen loading="lazy"></iframe>
+    </aside>"""
+    else:
+        player_pane = """
+    <aside class="player-pane empty">
+      <div class="player-head">
+        <span class="player-title">牌谱回放</span>
+      </div>
+      <div class="player-empty">无牌谱数据，无法嵌入回放</div>
+    </aside>"""
+
+    # Omit bulky tenhou log from the debug JSON blob (already in iframe src).
+    report_embed = {k: v for k, v in report.items() if k != "tenhou"}
+    # Keep JSON parseable via textContent: do not html.escape (script data
+    # does not decode entities). Only neutralize </script> breakout.
+    report_json = json.dumps(report_embed, ensure_ascii=False).replace(
+        "</", "<\\/"
     )
 
     return f"""<!doctype html>
@@ -1111,32 +1157,52 @@ def render_classic_html(report: dict, tile_base: str = "../assets/tiles") -> str
   --ok:#0f766e; --ok-bg:#e6f5f0; --diff:#be123c; --diff-bg:#fde8ee;
   --fair:#a16207; --fair-bg:#fef9c3;
   --best:#0f766e; --shadow:0 8px 24px rgba(15,45,38,.08);
+  --header-h:0px;
 }}
 * {{ box-sizing:border-box; }}
+html, body {{ height:100%; }}
 body {{
   margin:0; font-family:"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
   background:var(--bg); color:var(--text); line-height:1.45;
+  overflow:hidden;
 }}
-header {{
+.page {{
+  height:100vh; height:100dvh;
+  display:grid; grid-template-rows:auto 1fr;
+}}
+header.topbar {{
   background:linear-gradient(135deg, #1a5c4a 0%, #247a62 55%, #2f9b7a 100%);
-  color:#fff; padding:1.1rem 1.25rem 1.25rem;
+  color:#fff; padding:.85rem 1.15rem .95rem;
   box-shadow:0 4px 18px rgba(15,45,38,.22);
+  z-index:20;
 }}
-.head-inner {{ max-width:1100px; margin:0 auto; }}
-header h1 {{ margin:0 0 .55rem; font-size:1.55rem; letter-spacing:.02em; }}
-.stats {{ display:flex; flex-wrap:wrap; gap:.45rem .7rem; }}
+.head-inner {{
+  display:flex; flex-wrap:wrap; align-items:flex-end; gap:.55rem 1.25rem;
+}}
+.head-text {{ min-width:0; flex:1; }}
+header h1 {{ margin:0; font-size:1.35rem; letter-spacing:.02em; }}
+.subtitle {{
+  margin:.2rem 0 0; font-size:.82rem; opacity:.88; white-space:nowrap;
+  overflow:hidden; text-overflow:ellipsis;
+}}
+.stats {{ display:flex; flex-wrap:wrap; gap:.4rem .55rem; align-items:center; }}
 .stat {{
   background:rgba(255,255,255,.14); border:1px solid rgba(255,255,255,.22);
-  border-radius:999px; padding:.2rem .7rem; font-size:.86rem;
+  border-radius:999px; padding:.18rem .65rem; font-size:.82rem;
 }}
-.stat b {{ font-size:1.02rem; margin-right:.15rem; }}
+.stat b {{ font-size:.98rem; margin-right:.15rem; }}
 .stat-ok {{ background:rgba(190,255,230,.22); border-color:rgba(190,255,230,.45); }}
 .stat-bad {{ background:rgba(255,210,220,.22); border-color:rgba(255,210,220,.45); }}
-main {{ max-width:1100px; margin:0 auto; padding:1rem 1rem 2rem; }}
-.layout {{ display:flex; gap:1rem; align-items:flex-start; }}
+.shell {{
+  display:grid; grid-template-columns:minmax(0,1fr) minmax(340px,42%);
+  min-height:0; overflow:hidden;
+}}
+.analysis-pane {{
+  display:flex; gap:.75rem; min-width:0; min-height:0;
+  padding:.75rem .75rem .9rem 1rem; overflow:hidden;
+}}
 .side {{
-  width:168px; flex-shrink:0; position:sticky; top:.75rem;
-  max-height:calc(100vh - 1.5rem); overflow:auto;
+  width:156px; flex-shrink:0; overflow:auto;
   background:var(--card); border-radius:12px; padding:.65rem .55rem;
   box-shadow:var(--shadow); border:1px solid var(--line);
 }}
@@ -1165,7 +1231,26 @@ main {{ max-width:1100px; margin:0 auto; padding:1rem 1rem 2rem; }}
 .d-diff {{ background:var(--diff); }}
 .d-err {{ background:#f59e0b; }}
 .d-skip {{ background:#cbd5e1; }}
-.content {{ flex:1; min-width:0; }}
+.content {{
+  flex:1; min-width:0; overflow:auto; padding-right:.15rem;
+  scroll-behavior:smooth;
+}}
+.player-pane {{
+  display:flex; flex-direction:column; min-width:0; min-height:0;
+  border-left:1px solid var(--line); background:#e7eeea;
+}}
+.player-head {{
+  flex-shrink:0; display:flex; align-items:baseline; gap:.55rem;
+  padding:.55rem .85rem; background:#dfeae4; border-bottom:1px solid var(--line);
+}}
+.player-title {{ font-weight:700; font-size:.92rem; }}
+iframe.tenhou {{
+  flex:1; width:100%; min-height:0; border:0; background:#f2f2f2;
+}}
+.player-empty {{
+  flex:1; display:flex; align-items:center; justify-content:center;
+  color:var(--muted); font-size:.92rem; padding:1rem;
+}}
 .kyoku {{
   background:var(--card); border-radius:14px; margin:0 0 .9rem;
   border:1px solid var(--line); box-shadow:var(--shadow); overflow:hidden;
@@ -1205,7 +1290,7 @@ main {{ max-width:1100px; margin:0 auto; padding:1rem 1rem 2rem; }}
 .turn {{
   border:1px solid var(--line); border-radius:10px; margin:.45rem 0;
   padding:.45rem .65rem .55rem; background:#fff; border-left:4px solid var(--line);
-  scroll-margin-top:1rem;
+  scroll-margin-top:.75rem;
 }}
 .turn:hover {{ box-shadow:var(--shadow); }}
 .turn.s-ok {{ border-left-color:var(--ok); }}
@@ -1215,7 +1300,7 @@ main {{ max-width:1100px; margin:0 auto; padding:1rem 1rem 2rem; }}
 .turn > summary.turn-head {{
   list-style:none; cursor:pointer; user-select:none;
   display:flex; flex-wrap:wrap; gap:.45rem .6rem; align-items:center;
-  scroll-margin-top:1rem;
+  scroll-margin-top:.75rem;
 }}
 .turn > summary.turn-head::-webkit-details-marker {{ display:none; }}
 .turn > summary.turn-head::before {{
@@ -1380,59 +1465,63 @@ table.riichi tr .deal-in.safe {{ color:var(--ok); font-weight:700; }}
   text-align:center; color:var(--muted); font-size:.8rem;
   padding:1.5rem 0 .5rem;
 }}
-.back-top {{
-  position:fixed; right:1.1rem; bottom:1.1rem; z-index:40;
-  width:2.5rem; height:2.5rem; border:none; border-radius:14px;
-  background:linear-gradient(160deg,var(--accent),var(--felt));
-  color:#fff; cursor:pointer;
-  display:flex; align-items:center; justify-content:center;
-  box-shadow:0 6px 16px rgba(15,45,38,.24), inset 0 1px 0 rgba(255,255,255,.25);
-  opacity:0; pointer-events:none; transform:translateY(.5rem);
-  transition:opacity .2s ease, transform .2s ease, box-shadow .2s ease, filter .2s ease;
+@media (max-width:1100px) {{
+  .shell {{ grid-template-columns:minmax(0,1fr) minmax(300px,38%); }}
+  .side {{ width:136px; }}
 }}
-.back-top svg {{ width:1.05rem; height:1.05rem; display:block; }}
-.back-top:hover {{
-  filter:brightness(1.08);
-  box-shadow:0 10px 22px rgba(15,45,38,.3), inset 0 1px 0 rgba(255,255,255,.3);
-  transform:translateY(-2px);
-}}
-.back-top:active {{ transform:translateY(0); filter:brightness(.96); }}
-.back-top.show {{ opacity:1; pointer-events:auto; }}
-.back-top.show:hover {{ transform:translateY(-2px); }}
 @media (max-width:860px) {{
-  .layout {{ flex-direction:column; }}
-  .side {{ position:static; width:100%; max-height:42vh; }}
+  body {{ overflow:auto; }}
+  .page {{ height:auto; min-height:100vh; min-height:100dvh; }}
+  .shell {{
+    grid-template-columns:1fr; grid-template-rows:minmax(280px,42vh) auto;
+  }}
+  .player-pane {{
+    border-left:0; border-bottom:1px solid var(--line); order:-1;
+  }}
+  .analysis-pane {{
+    flex-direction:column; overflow:visible; height:auto;
+  }}
+  .side {{
+    width:100%; max-height:28vh; position:static;
+  }}
+  .content {{ overflow:visible; }}
 }}
 @media (max-width:640px) {{
   .tile-img {{ width:28px; height:39px; }}
   .meta {{ margin-left:0; }}
-  header h1 {{ font-size:1.25rem; }}
-  .back-top {{ right:.85rem; bottom:.85rem; }}
+  header h1 {{ font-size:1.15rem; }}
 }}
 </style>
 </head>
 <body>
-<header>
+<div class="page">
+<header class="topbar">
   <div class="head-inner">
-    <h1>MewJ 牌谱检讨</h1>
+    <div class="head-text">
+      <h1>MewJ 牌谱检讨</h1>
+      {subtitle_html}
+    </div>
     {stats_html}
   </div>
 </header>
-<main>
-  <div class="layout">
+<div class="shell">
+  <div class="analysis-pane">
     <aside class="side">
       <div class="side-title">目录</div>
       {"".join(side_groups)}
     </aside>
-    <div class="content">
+    <div class="content" id="analysis-scroll">
       {"".join(sections)}
       <div class="foot">MewJ 牌谱检讨报告</div>
     </div>
   </div>
-</main>
-<button type="button" class="back-top" id="back-top" aria-label="回到顶部" title="回到顶部"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 5.2 20 18H4Z" fill="currentColor"/><path d="M12 5.2 20 18H4Z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg></button>
-<script type="application/json" id="report-json">{html.escape(json.dumps(report, ensure_ascii=False))}</script>
+  {player_pane}
+</div>
+</div>
+<script type="application/json" id="report-json">{report_json}</script>
 <script>
+var analysisScroll = document.getElementById('analysis-scroll');
+
 document.addEventListener('click', function (e) {{
   var btn = e.target.closest('.tab-btn');
   if (!btn) return;
@@ -1448,19 +1537,6 @@ document.addEventListener('click', function (e) {{
     p.classList.toggle('active', p.getAttribute('data-panel') === name);
   }});
 }});
-
-(function () {{
-  var backTop = document.getElementById('back-top');
-  if (!backTop) return;
-  function syncBackTop() {{
-    backTop.classList.toggle('show', window.pageYOffset > 320);
-  }}
-  backTop.addEventListener('click', function () {{
-    window.scrollTo({{ top: 0, behavior: 'smooth' }});
-  }});
-  window.addEventListener('scroll', syncBackTop, {{ passive: true }});
-  syncBackTop();
-}})();
 
 function exclusiveDetails(selector, scopeFn) {{
   document.querySelectorAll(selector).forEach(function (el) {{
@@ -1504,6 +1580,15 @@ function turnScrollAnchor(turn) {{
 
 function scrollTurnToTop(turn, smooth) {{
   var anchor = turnScrollAnchor(turn);
+  if (analysisScroll) {{
+    var paneTop = analysisScroll.getBoundingClientRect().top;
+    var y = analysisScroll.scrollTop + (anchor.getBoundingClientRect().top - paneTop) - 8;
+    analysisScroll.scrollTo({{
+      top: Math.max(0, y),
+      behavior: smooth ? 'smooth' : 'auto',
+    }});
+    return;
+  }}
   var top = anchor.getBoundingClientRect().top + window.pageYOffset - 8;
   window.scrollTo({{
     top: Math.max(0, top),

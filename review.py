@@ -1141,6 +1141,25 @@ def analyze_decision_resilient(
     ) from last_exc
 
 
+_TENHOU_VIEWER_KEYS = (
+    "dan",
+    "lobby",
+    "log",
+    "name",
+    "rate",
+    "ratingc",
+    "rule",
+    "sx",
+    "title",
+    "sc",
+)
+
+
+def _tenhou_viewer_payload(paipu: dict) -> dict:
+    """Strip MewJ-only fields; keep a tenhou.net/6 JSON suitable for /5 viewer."""
+    return {k: paipu[k] for k in _TENHOU_VIEWER_KEYS if k in paipu}
+
+
 def review_paipu(
     paipu: dict,
     seat: int,
@@ -1551,4 +1570,6 @@ def _review_paipu_body(
         "seat": seat,
         "player": (paipu.get("name") or [None] * 4)[seat],
         "kyokus": report_kyokus,
+        # Slim tenhou.net/6 payload for the embedded viewer (full game).
+        "tenhou": _tenhou_viewer_payload(paipu),
     }
