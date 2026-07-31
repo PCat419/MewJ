@@ -1124,7 +1124,7 @@ def render_classic_html(
     tenhou = report.get("tenhou")
     tenhou_bundle_json = ""
     # Local viewer (vendored 1129.js) — avoids waiting on tenhou.net page load.
-    # Tile images still come from cdn.tenhou.net (browser-cached after first kyoku).
+    # All viewer tile/digit/seat-wind assets are local under assets/tenhou/.
     viewer_url = (viewer_base or "../assets/tenhou/viewer.html").replace("\\", "/")
     if isinstance(tenhou, dict) and isinstance(tenhou.get("kyokus"), list):
         # New Mortal-style bundle: base meta + per-kyoku logs.
