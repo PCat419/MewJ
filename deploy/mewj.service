@@ -1,0 +1,21 @@
+[Unit]
+Description=MewJ mahjong review web service
+After=network.target
+
+[Service]
+Type=simple
+User=mewj
+Group=mewj
+WorkingDirectory=/opt/mewj
+Environment=PYTHONUNBUFFERED=1
+Environment=MEWJ_WEB_MODE=server
+Environment=MEWJ_REPORT_MODE=server
+EnvironmentFile=-/opt/mewj/.env
+ExecStart=/opt/mewj/.venv/bin/python web.py
+Restart=on-failure
+RestartSec=5
+# nanikiru workers bind consecutive ports from NANIKIRU_URL
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

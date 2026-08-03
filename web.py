@@ -47,6 +47,21 @@ _LAST_CLIENT_AT = 0.0
 _STARTED_AT = 0.0
 
 
+def web_mode() -> str:
+    """Return the configured web mode: local or server."""
+    mode = os.environ.get("MEWJ_WEB_MODE", "local").strip().lower()
+    if mode not in {"local", "server"}:
+        raise ValueError(
+            f"Invalid MEWJ_WEB_MODE={mode!r}; expected 'local' or 'server'"
+        )
+    return mode
+
+
+def _server_mode() -> bool:
+    """Whether the web UI is running as a persistent deployed service."""
+    return web_mode() == "server"
+
+
 def _touch_client() -> None:
     global _LAST_CLIENT_AT
     with _CLIENT_LOCK:
@@ -196,6 +211,7 @@ def _job_snapshot(job: dict[str, Any]) -> dict[str, Any]:
             "progress_total": job.get("progress_total"),
             "created_at": job["created_at"],
             "finished_at": job["finished_at"],
+            "server_mode": _server_mode(),
         }
 
 
@@ -228,7 +244,8 @@ def _run_job(job_id: str) -> None:
                 job["progress_done"] = job["progress_total"]
             job["finished_at"] = time.time()
             job["logs"].append(f"完成: {rel}")
-        _open_report_and_exit(out)
+        if not _server_mode():
+            _open_report_and_exit(out)
     except Exception as exc:
         capture.flush()
         with job["lock"]:
@@ -560,7 +577,7 @@ button.ghost {
     } else if (state === 'done') {
       bar.classList.add('done');
       barFill.style.width = '100%';
-      label.textContent = '完成，报告已打开';
+      label.textContent = job.server_mode ? '完成' : '完成，报告已打开';
       pctEl.textContent = '100%';
       showError('');
     } else if (state === 'error') {
@@ -591,16 +608,24 @@ button.ghost {
           if (job.status === 'done') {
             stopPoll();
             setBusy(false);
-            // 报告已用系统浏览器打开；关掉本输入页
-            setTimeout(function () {
-              window.close();
-              // 部分浏览器禁止脚本关标签：退化为空白提示页
-              document.documentElement.innerHTML =
-                '<head><meta charset="utf-8"><title>MewJ</title></head>' +
-                '<body style="margin:0;min-height:100vh;display:flex;align-items:center;' +
-                'justify-content:center;font-family:Segoe UI,PingFang SC,Microsoft YaHei,sans-serif;' +
-                'background:#e7f0eb;color:#6b7f77;font-size:.95rem">报告已打开，可关闭此页</body>';
-            }, 400);
+            if (job.server_mode) {
+              resetBtn.hidden = false;
+              if (job.report_url) {
+                window.open(job.report_url, '_blank');
+                label.textContent = '完成，报告已打开';
+              }
+            } else {
+              // 本地模式由系统浏览器打开报告，然后关闭输入页。
+              setTimeout(function () {
+                window.close();
+                // 部分浏览器禁止脚本关标签：退化为空白提示页。
+                document.documentElement.innerHTML =
+                  '<head><meta charset="utf-8"><title>MewJ</title></head>' +
+                  '<body style="margin:0;min-height:100vh;display:flex;align-items:center;' +
+                  'justify-content:center;font-family:Segoe UI,PingFang SC,Microsoft YaHei,sans-serif;' +
+                  'background:#e7f0eb;color:#6b7f77;font-size:.95rem">报告已打开，可关闭此页</body>';
+              }, 400);
+            }
           } else if (job.status === 'error') {
             stopPoll();
             setBusy(false);
@@ -824,6 +849,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     load_dotenv(MEWJ_ROOT / ".env", MEWJ_ROOT.parent / "tensoul" / ".env")
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
+    try:
+        web_mode()
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
     host = os.environ.get("MEWJ_WEB_HOST", DEFAULT_HOST).strip() or DEFAULT_HOST
     port_s = os.environ.get("MEWJ_WEB_PORT", str(DEFAULT_PORT)).strip()
     try:
@@ -837,9 +868,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     _STARTED_AT = time.time()
     url = f"http://{host}:{port}/"
     print(f"MewJ Web 已启动: {url}", flush=True)
-    print("关闭输入页或检讨完成后将自动退出；也可按 Ctrl+C 停止。", flush=True)
-
-    threading.Thread(target=_watchdog_loop, daemon=True).start()
+    if _server_mode():
+        print("运行模式: server（常驻服务）；可按 Ctrl+C 停止。", flush=True)
+    else:
+        print("运行模式: local；关闭输入页或检讨完成后将自动退出。", flush=True)
+        threading.Thread(target=_watchdog_loop, daemon=True).start()
 
     def _open_browser() -> None:
         import webbrowser
@@ -850,7 +883,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         except Exception as exc:
             print(f"打开浏览器失败: {exc}", flush=True)
 
-    threading.Thread(target=_open_browser, daemon=True).start()
+    if not _server_mode():
+        threading.Thread(target=_open_browser, daemon=True).start()
 
     try:
         server.serve_forever()
