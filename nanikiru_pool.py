@@ -30,15 +30,17 @@ def _mewj_root() -> Path:
 
 
 def default_nanikiru_exe() -> Path:
-    """Resolve nanikiru.exe for portable MewJ runtime.
+    """Resolve the platform-specific nanikiru binary for portable MewJ.
 
-    Only ``MEWJ_NANIKIRU_EXE`` or ``MewJ/engine/nanikiru.exe`` — never
-    ``../mahjong-cpp/build`` (MewJ must run without sibling source trees).
+    Prefer ``MEWJ_NANIKIRU_EXE``; otherwise use ``engine/nanikiru.exe`` on
+    Windows and ``engine/nanikiru`` elsewhere. Never depend on a sibling
+    source/build tree.
     """
     env = os.environ.get("MEWJ_NANIKIRU_EXE")
     if env:
         return Path(env)
-    return _mewj_root() / "engine" / "nanikiru.exe"
+    name = "nanikiru.exe" if sys.platform == "win32" else "nanikiru"
+    return _mewj_root() / "engine" / name
 
 
 def nanikiru_port(url: str) -> int:
@@ -293,7 +295,7 @@ class NanikiruPool:
         self, port: int, url: str, *, wait: bool = True
     ) -> Optional[WorkerSlot]:
         if not self.exe.is_file():
-            print(f"  [warn] nanikiru.exe not found: {self.exe}", flush=True)
+            print(f"  [warn] nanikiru not found: {self.exe}", flush=True)
             return None
         log_handle = open(self._log_path, "a", encoding="utf-8")
         creationflags = 0

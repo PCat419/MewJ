@@ -9,3 +9,6 @@ dev/
 # 引擎运行时在 engine/ 旁写的日志与崩溃转储
 engine/log.txt
 engine/crash_*.txt
+# Linux 本机构建产物（由 deploy/build_nanikiru.sh 生成）
+engine/nanikiru
+build-linux/

@@ -690,12 +690,16 @@ def _legacy_restart_nanikiru(
     nanikiru_url: str = DEFAULT_NANIKIRU,
     exe: Optional[Path] = None,
 ) -> bool:
-    """Single-instance restart (PID of owned proc, else taskkill /IM)."""
+    """Restart only the nanikiru process owned by this Python process.
+
+    An unowned listener must never be killed here: another feature may run a
+    different nanikiru build or use another port.
+    """
     global _NANIKIRU_PROC, _NANIKIRU_LOG_HANDLE, _ATEXIT_REGISTERED
     path = Path(exe) if exe else DEFAULT_NANIKIRU_EXE
     port = nanikiru_port(nanikiru_url)
     if not path.is_file():
-        print(f"  [warn] nanikiru.exe not found: {path}", flush=True)
+        print(f"  [warn] nanikiru not found: {path}", flush=True)
         return False
 
     if _NANIKIRU_PROC is not None and _NANIKIRU_PROC.poll() is None:
@@ -707,15 +711,6 @@ def _legacy_restart_nanikiru(
                 _NANIKIRU_PROC.kill()
             except Exception:
                 pass
-    elif sys.platform == "win32":
-        subprocess.run(
-            ["taskkill", "/IM", "nanikiru.exe", "/F"],
-            capture_output=True,
-            check=False,
-        )
-    else:
-        subprocess.run(["pkill", "-f", "nanikiru"], capture_output=True, check=False)
-
     if _NANIKIRU_LOG_HANDLE is not None:
         try:
             _NANIKIRU_LOG_HANDLE.close()
@@ -1137,8 +1132,8 @@ def analyze_decision_resilient(
                 break
             if not restart_nanikiru(url):
                 raise RuntimeError(
-                    "nanikiru 崩溃后无法重启。请检查 nanikiru.exe 路径"
-                    "（环境变量 MEWJ_NANIKIRU_EXE 或 MewJ/engine/nanikiru.exe）"
+                    "nanikiru 崩溃后无法重启。请检查 nanikiru 路径"
+                    "（环境变量 MEWJ_NANIKIRU_EXE 或 engine/nanikiru[.exe]）"
                 ) from exc
     assert last_exc is not None
     raise RuntimeError(
