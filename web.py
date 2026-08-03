@@ -47,9 +47,19 @@ _LAST_CLIENT_AT = 0.0
 _STARTED_AT = 0.0
 
 
+def web_mode() -> str:
+    """Return the configured web mode: local or server."""
+    mode = os.environ.get("MEWJ_WEB_MODE", "local").strip().lower()
+    if mode not in {"local", "server"}:
+        raise ValueError(
+            f"Invalid MEWJ_WEB_MODE={mode!r}; expected 'local' or 'server'"
+        )
+    return mode
+
+
 def _server_mode() -> bool:
     """Whether the web UI is running as a persistent deployed service."""
-    return os.environ.get("MEWJ_WEB_MODE", "local").strip().lower() == "server"
+    return web_mode() == "server"
 
 
 def _touch_client() -> None:
@@ -838,6 +848,12 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     load_dotenv(MEWJ_ROOT / ".env", MEWJ_ROOT.parent / "tensoul" / ".env")
     OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    try:
+        web_mode()
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
 
     host = os.environ.get("MEWJ_WEB_HOST", DEFAULT_HOST).strip() or DEFAULT_HOST
     port_s = os.environ.get("MEWJ_WEB_PORT", str(DEFAULT_PORT)).strip()

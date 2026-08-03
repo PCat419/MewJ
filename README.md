@@ -130,8 +130,8 @@ chmod 600 .env
 | `NANIKIRU_URL` | 首个引擎服务地址 | `http://127.0.0.1:50000` |
 | `MEWJ_WORKERS` | 并行引擎进程数 | `4` |
 | `MEWJ_NANIKIRU_EXE` | 手动指定引擎路径 | 按平台自动选择 |
-| `MEWJ_WEB_MODE` | `local` 临时 Web；`server` 常驻 Web | `local` |
-| `MEWJ_REPORT_MODE` | `local` 离线报告；`server` 在线回放报告 | `local` |
+| `MEWJ_WEB_MODE` | 仅 `local` / `server`：临时 Web 或常驻 Web | `local` |
+| `MEWJ_REPORT_MODE` | 仅 `local` / `server`：离线报告或在线回放报告 | `local` |
 | `MEWJ_WEB_HOST` | Web 监听地址 | `127.0.0.1` |
 | `MEWJ_WEB_PORT` | Web 监听端口 | `8765` |
 
